@@ -3562,6 +3562,26 @@ a:active {
     }
 }
 
+@keyframes zombiesPulse {
+    from {
+        background-color: #2b0c36;
+        -webkit-box-shadow: 0 0 16px rgba(0, 240, 255, 0.6);
+    }
+    to {
+        background-color: #15061c;
+        -webkit-box-shadow: 0 0 8px rgba(255, 0, 85, 0.6);
+    }
+}
+
+.btn-mode-zombies {
+    animation-name: zombiesPulse;
+    animation-duration: 3s;
+    animation-iteration-count: infinite;
+    border-bottom: 4px solid #00f0ff !important;
+    color: #00f0ff !important;
+    text-shadow: 0 0 6px rgba(0, 240, 255, 0.8);
+}
+
 .btn-team-queue-mode-beach {
     background-repeat: no-repeat;
     background-size: 35px;

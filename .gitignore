@@ -68,3 +68,7 @@ Temporary Items
 *.vsix
 
 todo.md
+
+#ignore agent generated files
+docs/architecture-analysis.md
+docs/implementation-roadmap.md

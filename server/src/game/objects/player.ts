@@ -572,6 +572,8 @@ export class PlayerBarn {
 export class Player extends BaseGameObject {
     override readonly __type = ObjectType.Player;
 
+    isZombie = false;
+
     bounds = collider.createAabbExtents(
         v2.create(0, 0),
         v2.create(GameConfig.player.maxVisualRadius, GameConfig.player.maxVisualRadius),

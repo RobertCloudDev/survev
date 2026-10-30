@@ -14,6 +14,8 @@ enum GameMode {
     Team,
     /** irrelevant to gamemode type, always the mode if faction map is selected */
     Faction,
+    /** round-based co-op zombie survival */
+    Zombies,
 }
 
 export class GameModeManager {
@@ -25,9 +27,10 @@ export class GameModeManager {
         this.game = game;
 
         this.mode = [
-            game.teamMode == TeamMode.Solo && !game.map.factionMode,
-            game.teamMode != TeamMode.Solo && !game.map.factionMode,
-            game.map.factionMode,
+            game.teamMode == TeamMode.Solo && !game.map.factionMode && !game.map.zombiesMode,
+            game.teamMode != TeamMode.Solo && !game.map.factionMode && !game.map.zombiesMode,
+            game.map.factionMode && !game.map.zombiesMode,
+            game.map.zombiesMode,
         ].findIndex((isMode) => isMode);
 
         this.isSolo = this.mode === GameMode.Solo;
@@ -37,6 +40,8 @@ export class GameModeManager {
         switch (this.mode) {
             case GameMode.Solo:
                 return this.game.playerBarn.livingPlayers.length;
+            case GameMode.Zombies:
+                return this.game.playerBarn.livingPlayers.filter((p) => !p.isZombie).length;
             case GameMode.Team:
                 return this.game.playerBarn.getAliveGroups().length;
             case GameMode.Faction:
@@ -50,6 +55,9 @@ export class GameModeManager {
         switch (this.mode) {
             case GameMode.Solo:
                 return this.game.playerBarn.livingPlayers.filter((p) => !p.canDespawn())
+                    .length;
+            case GameMode.Zombies:
+                return this.game.playerBarn.livingPlayers.filter((p) => !p.isZombie && !p.canDespawn())
                     .length;
             case GameMode.Team:
                 return this.game.playerBarn.getAliveGroups().filter((group) => {
@@ -67,7 +75,8 @@ export class GameModeManager {
         const players = [...this.game.playerBarn.players];
 
         switch (this.mode) {
-            case GameMode.Solo: {
+            case GameMode.Solo:
+            case GameMode.Zombies: {
                 return players
                     .sort((a, b) => {
                         return b.killedIndex - a.killedIndex;
@@ -119,7 +128,11 @@ export class GameModeManager {
         switch (this.mode) {
             case GameMode.Solo: {
                 const winner = this.game.playerBarn.livingPlayers[0];
-                return winner.teamId;
+                return winner ? winner.teamId : 0;
+            }
+            case GameMode.Zombies: {
+                const winner = this.game.playerBarn.livingPlayers.find((p) => !p.isZombie);
+                return winner ? winner.teamId : 0;
             }
             case GameMode.Team: {
                 const winner = this.game.playerBarn.getAliveGroups()[0];
@@ -133,13 +146,24 @@ export class GameModeManager {
     }
 
     isGameStarted(): boolean {
+        if (this.mode === GameMode.Zombies) {
+            return this.cantDespawnAliveCount() >= 1;
+        }
         return this.cantDespawnAliveCount() > 1;
+    }
+
+    isGameOver(): boolean {
+        if (this.mode === GameMode.Zombies) {
+            return this.aliveCount() <= 0;
+        }
+        return this.aliveCount() <= 1;
     }
 
     updateAliveCounts(aliveCounts: number[]): void {
         switch (this.mode) {
             case GameMode.Solo:
             case GameMode.Team:
+            case GameMode.Zombies:
                 aliveCounts.push(this.game.aliveCount);
                 break;
             case GameMode.Faction:
@@ -162,6 +186,8 @@ export class GameModeManager {
         switch (this.mode) {
             case GameMode.Solo:
                 return [this.game.playerBarn.livingPlayers];
+            case GameMode.Zombies:
+                return [this.game.playerBarn.livingPlayers.filter((p) => !p.isZombie)];
             case GameMode.Team:
                 return this.game.playerBarn.groups.map((g) => g.livingPlayers);
             case GameMode.Faction:
@@ -176,6 +202,7 @@ export class GameModeManager {
             case GameMode.Team:
                 return player.group!.players;
             case GameMode.Faction:
+            case GameMode.Zombies:
                 return this.game.playerBarn.players;
         }
     }
@@ -188,6 +215,8 @@ export class GameModeManager {
                 return player.group!.livingPlayers;
             case GameMode.Faction:
                 return player.team!.livingPlayers;
+            case GameMode.Zombies:
+                return this.game.playerBarn.livingPlayers.filter((p) => !p.isZombie);
         }
     }
 
@@ -219,6 +248,7 @@ export class GameModeManager {
     showStatsMsg(player: Player): boolean {
         switch (this.mode) {
             case GameMode.Solo:
+            case GameMode.Zombies:
                 return false;
             case GameMode.Team:
                 return !player.group!.allDeadOrDisconnected && this.aliveCount() > 1;
@@ -230,6 +260,7 @@ export class GameModeManager {
     getGameoverPlayers(player: Player): Player[] {
         switch (this.mode) {
             case GameMode.Solo:
+            case GameMode.Zombies:
                 return [player];
             case GameMode.Team:
                 return player.group!.players;
@@ -275,7 +306,7 @@ export class GameModeManager {
     }
 
     handlePlayerDeath(player: Player, params: DamageParams): void {
-        if (this.isSolo) {
+        if (this.isSolo || (this.mode === GameMode.Zombies && !player.group)) {
             player.kill(params);
         } else {
             const group = this.mode === GameMode.Faction ? player.team! : player.group!;

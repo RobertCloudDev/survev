@@ -34,6 +34,7 @@ export function getConfig(isProduction: boolean, dir: string) {
             { mapName: "main", teamMode: TeamMode.Solo, enabled: true },
             { mapName: "main", teamMode: TeamMode.Duo, enabled: true },
             { mapName: "main", teamMode: TeamMode.Squad, enabled: true },
+            { mapName: "zombies_cyberpunk", teamMode: TeamMode.Solo, enabled: true },
         ],
         clientTheme: "main",
         passType: "pass_survivr2",

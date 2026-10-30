@@ -132,6 +132,7 @@ export class Map {
     potatoMode = false;
     perkMode = false;
     turkeyMode = false;
+    zombiesMode = false;
     seed = 0;
     width = 0;
     height = 0;
@@ -210,6 +211,7 @@ export class Map {
         this.potatoMode = !!this.mapDef.gameMode.potatoMode;
         this.perkMode = !!this.mapDef.gameMode.perkMode;
         this.turkeyMode = !!this.mapDef.gameMode.turkeyMode;
+        this.zombiesMode = !!this.mapDef.gameMode.zombiesMode;
         this.seed = mapMsg.seed;
         this.width = mapMsg.width;
         this.height = mapMsg.height;

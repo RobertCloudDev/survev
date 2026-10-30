@@ -42,6 +42,7 @@ export class Application {
     playMode0Btn = $("#btn-start-mode-0");
     playMode1Btn = $("#btn-start-mode-1");
     playMode2Btn = $("#btn-start-mode-2");
+    playMode3Btn = $("#btn-start-mode-3");
     muteBtns = $(".btn-sound-toggle");
     aimLineBtn = $("#btn-game-aim-line");
     masterSliders = $<HTMLInputElement>(".sl-master-volume");
@@ -177,6 +178,11 @@ export class Application {
             this.playMode2Btn.on("click", () => {
                 SDK.requestMidGameAd(() => {
                     this.tryQuickStartGame(2);
+                });
+            });
+            this.playMode3Btn.on("click", () => {
+                SDK.requestMidGameAd(() => {
+                    this.tryQuickStartGame(3);
                 });
             });
 
@@ -616,6 +622,7 @@ export class Application {
         updateButton(this.playMode0Btn, 0);
         updateButton(this.playMode1Btn, 1);
         updateButton(this.playMode2Btn, 2);
+        updateButton(this.playMode3Btn, 3);
     }
 
     waitOnAccount(cb: () => void) {

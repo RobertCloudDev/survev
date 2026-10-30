@@ -474,6 +474,7 @@
                         <div id="ui-kill-leader-count">0</div>
                     </div>
                 </div>
+                <div id="ui-zombies-mode-indicator" class="js-ui-hud-show" style="display: none; position: absolute; top: 16px; left: 50%; transform: translateX(-50%); color: #00f0ff; font-family: 'Play', sans-serif; font-size: 15px; font-weight: bold; letter-spacing: 2px; text-shadow: 0 0 8px rgba(0,240,255,0.8); background: rgba(10, 10, 20, 0.85); border: 1px solid #00f0ff; border-radius: 4px; padding: 4px 14px; pointer-events: none; z-index: 20;">ZOMBIES MODE &bull; ROUND 1</div>
                 <div id="ui-killfeed-wrapper">
                     <div id="ui-killfeed" class="js-ui-map-hidden js-ui-hud-show">
                         <div id="ui-killfeed-contents"></div>
@@ -1125,6 +1126,12 @@
                                         data-l10n="index-play-squad"
                                     >Play Squad</a>
                                 </div>
+                                <a
+                                    class="btn-green btn-darken menu-option btn-mode-zombies"
+                                    id="btn-start-mode-3"
+                                    data-l10n="index-play-zombies"
+                                    style="display: none; margin-top: 6px;"
+                                >Play Zombies</a>
                                 <div class="btns-double-row">
                                     <a
                                         class="btn-darken menu-option btn-team-option"

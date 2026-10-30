@@ -106,6 +106,7 @@ export enum MapId {
     Birthday = 8,
     Beach = 9,
     FactionPotato = 10,
+    Zombies = 11,
 }
 
 export enum Plane {

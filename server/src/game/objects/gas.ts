@@ -222,6 +222,13 @@ export class Gas {
         this.currentPos = v2.copy(this.posOld);
 
         const stage = this._getStageData();
+        if (this.game.map.zombiesMode) {
+            this.radOld = 2 * this.mapSize;
+            this.radNew = this.currentRad = 2 * this.mapSize;
+            this.duration = 999999;
+            this.damage = 0;
+            return;
+        }
         this.radOld = 0.85 * this.mapSize;
         this.radNew = this.currentRad = stage.rad * this.mapSize;
         this.duration = stage.duration;
@@ -229,6 +236,7 @@ export class Gas {
     }
 
     update(dt: number) {
+        if (this.game.map.zombiesMode) return;
         this._gasTicker += dt;
 
         if (this._running) {
@@ -255,6 +263,10 @@ export class Gas {
     }
 
     advanceGasStage() {
+        if (this.game.map.zombiesMode) {
+            this._running = false;
+            return;
+        }
         this.stage++;
         this._running = true;
 

@@ -139,6 +139,7 @@ export class UiManager {
 
     gasIcon = $("#ui-gas-icon");
     gasTimer = $("#ui-gas-timer");
+    zombiesIndicator = $("#ui-zombies-mode-indicator");
     mapMinimizeButton = $("#ui-map-minimize");
     menuDisplayButton = $("#ui-menu-display");
     bottomCenterRight = $("#ui-bottom-center-right");
@@ -551,6 +552,7 @@ export class UiManager {
 
     m_free() {
         this.gasRenderer.free();
+        this.zombiesIndicator.hide();
 
         this.clearUI();
 
@@ -632,6 +634,12 @@ export class UiManager {
 
         if (!device.mobile) {
             $("#ui-killfeed-wrapper").css("top", displayLeader ? "60px" : "12px");
+        }
+
+        if (map.zombiesMode) {
+            this.zombiesIndicator.show();
+        } else {
+            this.zombiesIndicator.hide();
         }
     }
 

@@ -23,6 +23,7 @@ import { Woods } from "./maps/woodsDefs.ts";
 import { WoodsSnow } from "./maps/woodsSnowDefs.ts";
 import { WoodsSpring } from "./maps/woodsSpringDefs.ts";
 import { WoodsSummer } from "./maps/woodsSummerDefs.ts";
+import { ZombiesCyberpunk } from "./maps/zombiesCyberpunkDefs.ts";
 
 export type Atlas =
     | "loadout"
@@ -59,6 +60,7 @@ const _MapDefs = {
     turkey: Turkey,
     birthday: Birthday,
     beach: Beach,
+    zombies_cyberpunk: ZombiesCyberpunk,
 
     /* STRIP_FROM_PROD_CLIENT:START */
     test_normal: testNormal,
@@ -134,6 +136,7 @@ export interface MapDef {
         perkModeRoles?: string[];
         turkeyMode?: boolean;
         spookyKillSounds?: boolean;
+        zombiesMode?: boolean;
     };
     gameConfig: {
         planes: {

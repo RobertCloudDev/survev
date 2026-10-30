@@ -23,6 +23,7 @@ import { PlayerBarn } from "./objects/player.ts";
 import { ProjectileBarn } from "./objects/projectile.ts";
 import { SmokeBarn } from "./objects/smoke.ts";
 import { Profiler } from "./profiler.ts";
+import { ZombiesManager } from "./zombiesManager.ts";
 
 export interface JoinTokenData {
     userId: string | null;
@@ -69,6 +70,7 @@ export class Game {
     isTeamMode: boolean;
     config: ServerGameConfig;
     modeManager: GameModeManager;
+    zombiesManager?: ZombiesManager;
 
     now!: number;
     profiler = new Profiler();
@@ -148,6 +150,10 @@ export class Game {
             for (let i = 1; i <= this.map.mapDef.gameMode.factions!; i++) {
                 this.playerBarn.addTeam(i);
             }
+        }
+
+        if (this.map.zombiesMode) {
+            this.zombiesManager = new ZombiesManager(this);
         }
 
         this.map.init();
@@ -259,6 +265,12 @@ export class Game {
         this.planeBarn.update(dt);
         this.profiler.endSample();
 
+        if (this.zombiesManager) {
+            this.profiler.addSample("zombies");
+            this.zombiesManager.update(dt);
+            this.profiler.endSample();
+        }
+
         const tickTime = performance.now() - this.now;
 
         if (tickTime > 1000) {
@@ -352,7 +364,7 @@ export class Game {
     checkGameOver() {
         if (this.over) return;
 
-        const didGameEnd = this.started && this.modeManager.aliveCount() <= 1;
+        const didGameEnd = this.started && this.modeManager.isGameOver();
 
         if (didGameEnd) {
             this.over = true;
