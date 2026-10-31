@@ -24,6 +24,7 @@ export class EditMsg implements AbstractMsg {
     godMode = false;
     moveObjs = false;
     preventGameStart = false;
+    zombiesNav = false;
 
     serialize(s: BitStream) {
         s.writeBoolean(this.zoomEnabled);
@@ -58,6 +59,7 @@ export class EditMsg implements AbstractMsg {
         s.writeBoolean(this.godMode);
         s.writeBoolean(this.moveObjs);
         s.writeBoolean(this.preventGameStart);
+        s.writeBoolean(this.zombiesNav);
     }
 
     deserialize(s: BitStream) {
@@ -93,5 +95,6 @@ export class EditMsg implements AbstractMsg {
         this.godMode = s.readBoolean();
         this.moveObjs = s.readBoolean();
         this.preventGameStart = s.readBoolean();
+        this.zombiesNav = s.readBoolean();
     }
 }

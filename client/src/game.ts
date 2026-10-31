@@ -14,6 +14,7 @@ import { debugLines } from "./debug/debugLines.ts";
 
 /* STRIP_FROM_PROD_CLIENT:START */
 import { Editor } from "./debug/editor.ts";
+import { ZombiesNavVisualizer } from "./debug/zombiesNavVisualizer.ts";
 /* STRIP_FROM_PROD_CLIENT:END */
 
 import { GameObjectDefs } from "../../shared/defs/register.ts";
@@ -115,6 +116,7 @@ export class Game {
 
     editor!: Editor;
     debugHUD!: DebugHUD;
+    zombiesNavVisualizer = new ZombiesNavVisualizer();
 
     seq!: number;
     seqInFlight!: boolean;
@@ -286,6 +288,7 @@ export class Game {
             this.m_renderer.layers[2],
             this.m_renderer.layers[3],
             this.m_debugDisplay,
+            this.zombiesNavVisualizer.container,
             this.m_gas.gasRenderer.display,
             this.m_touch.container,
             this.m_emoteBarn.container,
@@ -1004,6 +1007,7 @@ export class Game {
                 debugLines.m_render(this.m_camera, this.m_debugDisplay);
             }
             debugLines.flush();
+            this.zombiesNavVisualizer.render(this.m_camera, !!debug.zombiesNav);
         }
     }
 
@@ -1590,6 +1594,12 @@ export class Game {
                     this.m_uiManager.updatePlayersAliveRed(msg.teamAliveCounts[0]);
                     this.m_uiManager.updatePlayersAliveBlue(msg.teamAliveCounts[1]);
                 }
+                break;
+            }
+            case net.MsgType.ZombiesNavDebug: {
+                const msg = new net.ZombiesNavDebugMsg();
+                msg.deserialize(stream);
+                this.zombiesNavVisualizer.onDebugMsg(msg);
                 break;
             }
         }

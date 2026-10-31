@@ -15,6 +15,7 @@ import { PerkProperties } from "../../../../shared/defs/gameObjects/perkDefs.ts"
 import type { RoleDef } from "../../../../shared/defs/gameObjects/roleDefs.ts";
 import type { ThrowableDef } from "../../../../shared/defs/gameObjects/throwableDefs.ts";
 import { UnlockDefs } from "../../../../shared/defs/gameObjects/unlockDefs.ts";
+import type { ZombieDef } from "../../../../shared/defs/gameObjects/zombieDefs.ts";
 import { GameObjectDefs } from "../../../../shared/defs/register.ts";
 import {
     type Action,
@@ -573,6 +574,7 @@ export class Player extends BaseGameObject {
     override readonly __type = ObjectType.Player;
 
     isZombie = false;
+    zombieDef?: ZombieDef;
 
     bounds = collider.createAabbExtents(
         v2.create(0, 0),
@@ -1313,6 +1315,7 @@ export class Player extends BaseGameObject {
         noClip: false,
         teleportToPings: false,
         godMode: false,
+        zombiesNav: false,
 
         /** drag and drop loot, obstacles, and buildings */
         moveObjMode: <MoveObjsMode> {
@@ -2006,7 +2009,8 @@ export class Player extends BaseGameObject {
         // update the group spawn position to our current position every 1 second
         // if we are in a valid spawn position (not on water, inside a building, etc)
         if (
-            this.group?.players[0] === this
+            !this.isZombie
+            && this.group?.players[0] === this
             && this.game.canJoin
             && this.group.players.length < this.group.maxPlayers
         ) {
@@ -2423,6 +2427,10 @@ export class Player extends BaseGameObject {
 
         // teammates can't deal damage to each other
         if (playerSource && params.source !== this) {
+            // Prevent accidental damage between zombies
+            if (playerSource.isZombie && this.isZombie) {
+                return;
+            }
             if (playerSource.teamId === this.teamId && !this.disconnected) {
                 // Combat Stimulants Healing
                 const gameSourceDef = GameObjectDefs.typeToDefSafe(params.gameSourceType ?? "");
@@ -2513,8 +2521,14 @@ export class Player extends BaseGameObject {
         }
 
         this.damageTaken += finalDamage;
+        if (this.isZombie && this.game.zombiesManager) {
+            const ai = this.game.zombiesManager.zombies.find((z) => z.zombie === this);
+            if (ai) {
+                ai.takeDamage(finalDamage, playerSource);
+            }
+        }
         if (playerSource && params.source !== this) {
-            if (playerSource.groupId !== this.groupId) {
+            if (playerSource.groupId !== this.groupId && !this.isZombie && !playerSource.isZombie) {
                 playerSource.damageDealt += finalDamage;
                 playerSource.questManager.trackEvent("damage", {
                     amount: finalDamage,
@@ -2699,25 +2713,27 @@ export class Player extends BaseGameObject {
             this.killedBy = killCreditSource;
 
             if (killCreditSource !== this && killCreditSource.teamId !== this.teamId) {
-                killCreditSource.killedIds.push(this.matchDataId);
-                killCreditSource.kills++;
+                if (!this.isZombie) {
+                    killCreditSource.killedIds.push(this.matchDataId);
+                    killCreditSource.kills++;
 
-                let buildingType: Set<string> = new Set();
-                const wantsBuilding = killCreditSource.questManager.hasQuestWithFilter("building");
-                if (wantsBuilding) {
-                    // if no quests are interested in filtering by building, then don't calculate them
-                    buildingType = this.getIntersectingBuildings();
-                }
+                    let buildingType: Set<string> = new Set();
+                    const wantsBuilding = killCreditSource.questManager.hasQuestWithFilter("building");
+                    if (wantsBuilding) {
+                        // if no quests are interested in filtering by building, then don't calculate them
+                        buildingType = this.getIntersectingBuildings();
+                    }
 
-                killCreditSource.questManager.trackEvent("kill", {
-                    weaponType: params.weaponSourceType ?? params.gameSourceType ?? "",
-                    intersectingBuildings: [...buildingType],
-                    mode: this.game.teamMode,
-                    role: killCreditSource.role,
-                });
+                    killCreditSource.questManager.trackEvent("kill", {
+                        weaponType: params.weaponSourceType ?? params.gameSourceType ?? "",
+                        intersectingBuildings: [...buildingType],
+                        mode: this.game.teamMode,
+                        role: killCreditSource.role,
+                    });
 
-                if (killCreditSource.isKillLeader) {
-                    this.game.playerBarn.killLeaderDirty = true;
+                    if (killCreditSource.isKillLeader) {
+                        this.game.playerBarn.killLeaderDirty = true;
+                    }
                 }
 
                 if (killCreditSource.hasPerk("takedown")) {
@@ -2916,79 +2932,81 @@ export class Player extends BaseGameObject {
         // drop loot
         //
 
-        this.weaponManager.setCurWeapIndex(GameConfig.WeaponSlot.Melee);
-        for (let i = 0; i < GameConfig.WeaponSlot.Count; i++) {
-            const weap = this.weapons[i];
-            if (!weap.type) continue;
-            const def = GameObjectDefs.typeToDef(weap.type);
-            switch (def.type) {
-                case "gun":
-                    this.weaponManager.dropGun(i);
-                    weap.type = "";
-                    break;
-                case "melee":
-                    if (def.noDropOnDeath || weap.type === "fists") break;
-                    this.game.lootBarn.addLoot(weap.type, this.pos, this.layer, 1, {
+        if (!this.isZombie) {
+            this.weaponManager.setCurWeapIndex(GameConfig.WeaponSlot.Melee);
+            for (let i = 0; i < GameConfig.WeaponSlot.Count; i++) {
+                const weap = this.weapons[i];
+                if (!weap.type) continue;
+                const def = GameObjectDefs.typeToDef(weap.type);
+                switch (def.type) {
+                    case "gun":
+                        this.weaponManager.dropGun(i);
+                        weap.type = "";
+                        break;
+                    case "melee":
+                        if (def.noDropOnDeath || weap.type === "fists") break;
+                        this.game.lootBarn.addLoot(weap.type, this.pos, this.layer, 1, {
+                            pushSpeed: util.random(7.5, 11),
+                            dir: v2.randomUnit(),
+                        });
+                        weap.type = "fists";
+                        break;
+                    case "throwable":
+                        weap.type = "";
+                        break;
+                }
+            }
+
+            for (const item of Object.keys(this.invManager.items) as InventoryItem[]) {
+                // const def = GameObjectDefs[item] as AmmoDef | HealDef;
+                if (item == "1xscope" || (this.game.map.sniperMode && item == "2xscope")) {
+                    continue;
+                }
+
+                const amount = this.invManager.get(item);
+                if (amount > 0) {
+                    this.game.lootBarn.addLoot(item, this.pos, this.layer, amount, {
                         pushSpeed: util.random(7.5, 11),
                         dir: v2.randomUnit(),
                     });
-                    weap.type = "fists";
-                    break;
-                case "throwable":
-                    weap.type = "";
-                    break;
-            }
-        }
-
-        for (const item of Object.keys(this.invManager.items) as InventoryItem[]) {
-            // const def = GameObjectDefs[item] as AmmoDef | HealDef;
-            if (item == "1xscope" || (this.game.map.sniperMode && item == "2xscope")) {
-                continue;
+                }
             }
 
-            const amount = this.invManager.get(item);
-            if (amount > 0) {
-                this.game.lootBarn.addLoot(item, this.pos, this.layer, amount, {
+            for (const item of GEAR_TYPES) {
+                const type = this[item];
+                if (!type) continue;
+                const def = GameObjectDefs.typeToDef(type) as HelmetDef | ChestDef | BackpackDef;
+                if (!!(def as ChestDef).noDrop || def.level < 1) continue;
+                this.game.lootBarn.addLoot(type, this.pos, this.layer, 1, {
                     pushSpeed: util.random(7.5, 11),
                     dir: v2.randomUnit(),
                 });
             }
-        }
 
-        for (const item of GEAR_TYPES) {
-            const type = this[item];
-            if (!type) continue;
-            const def = GameObjectDefs.typeToDef(type) as HelmetDef | ChestDef | BackpackDef;
-            if (!!(def as ChestDef).noDrop || def.level < 1) continue;
-            this.game.lootBarn.addLoot(type, this.pos, this.layer, 1, {
-                pushSpeed: util.random(7.5, 11),
-                dir: v2.randomUnit(),
-            });
-        }
-
-        if (this.outfit) {
-            const def = GameObjectDefs.typeToDef(this.outfit, "outfit");
-            if (!def.noDropOnDeath && !def.noDrop && this.outfit !== this.loadout.outfit) {
-                this.game.lootBarn.addLoot(this.outfit, this.pos, this.layer, 1, {
-                    pushSpeed: util.random(7.5, 11),
-                    dir: v2.randomUnit(),
-                });
-            }
-        }
-
-        for (let i = this.perks.length - 1; i >= 0; i--) {
-            const perk = this.perks[i];
-            if (perk.droppable || perk.replaceOnDeath) {
-                this.game.lootBarn.addLoot(
-                    perk.replaceOnDeath || perk.type,
-                    this.pos,
-                    this.layer,
-                    1,
-                    {
+            if (this.outfit) {
+                const def = GameObjectDefs.typeToDef(this.outfit, "outfit");
+                if (!def.noDropOnDeath && !def.noDrop && this.outfit !== this.loadout.outfit) {
+                    this.game.lootBarn.addLoot(this.outfit, this.pos, this.layer, 1, {
                         pushSpeed: util.random(7.5, 11),
                         dir: v2.randomUnit(),
-                    },
-                );
+                    });
+                }
+            }
+
+            for (let i = this.perks.length - 1; i >= 0; i--) {
+                const perk = this.perks[i];
+                if (perk.droppable || perk.replaceOnDeath) {
+                    this.game.lootBarn.addLoot(
+                        perk.replaceOnDeath || perk.type,
+                        this.pos,
+                        this.layer,
+                        1,
+                        {
+                            pushSpeed: util.random(7.5, 11),
+                            dir: v2.randomUnit(),
+                        },
+                    );
+                }
             }
         }
         this._perks.length = 0;
@@ -3105,6 +3123,7 @@ export class Player extends BaseGameObject {
         for (let i = 0; i < 80; i++) {
             if (!aliveKiller) return undefined;
             if (aliveKiller === this) return undefined;
+            if (aliveKiller.isZombie) return undefined;
             if (aliveKiller.killedBy === aliveKiller) return undefined;
             if (checkedPlayers.has(aliveKiller)) return undefined;
 
@@ -3116,6 +3135,8 @@ export class Player extends BaseGameObject {
     }
 
     canDespawn() {
+        if (this.isZombie) return false;
+
         // special check for 50v50
         // we dont want eg leaders to despawn a second after being promoted :p
         if (this.game.map.factionMode && this.role) return false;
@@ -3345,6 +3366,7 @@ export class Player extends BaseGameObject {
     mousePos = v2.create(1, 0);
 
     shouldAcceptInput(input: Input): boolean {
+        if (this.isZombie) return false;
         return (
             !this.downed
             || input === GameConfig.Input.Interact // Players can interact with obstacles while downed.
@@ -3640,6 +3662,7 @@ export class Player extends BaseGameObject {
     }
 
     interactWith(obj: GameObject): void {
+        if (this.isZombie) return;
         switch (obj.__type) {
             case ObjectType.Loot:
                 this.pickupLoot(obj);
@@ -3714,6 +3737,7 @@ export class Player extends BaseGameObject {
 
     pickupTicker = 0;
     pickupLoot(obj: Loot) {
+        if (this.isZombie) return;
         if (obj.destroyed) return;
 
         const def = GameObjectDefs.typeToDef(obj.type);
@@ -4419,6 +4443,7 @@ export class Player extends BaseGameObject {
         this.debug.moveObjMode.enabled = msg.moveObjs;
 
         this.game.preventStart = msg.preventGameStart;
+        this.debug.zombiesNav = msg.zombiesNav;
 
         if (msg.spawnLootType) {
             const def = GameObjectDefs.typeToDefSafe(msg.spawnLootType);
@@ -4690,6 +4715,12 @@ export class Player extends BaseGameObject {
     }
 
     recalculateSpeed(hasTreeClimbing: boolean): void {
+        if (this.isZombie) {
+            const mult = this.zombieDef?.speedMult ?? 0.65;
+            this.speed = GameConfig.player.moveSpeed * mult;
+            return;
+        }
+
         if (this.debug.speedEnabled) {
             this.speed = this.debug.speed;
         } else if (this.actionType == GameConfig.Action.Revive) {

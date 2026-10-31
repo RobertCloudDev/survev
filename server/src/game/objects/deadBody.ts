@@ -16,7 +16,7 @@ export class DeadBodyBarn {
         }
     }
 
-    addDeadBody(pos: Vec2, playerId: number, layer: number, dir: Vec2) {
+    addDeadBody(pos: Vec2, playerId: number, layer: number, dir?: Vec2) {
         const deadBody = new DeadBody(this.game, pos, playerId, layer, dir);
         this.deadBodies.push(deadBody);
         this.game.objectRegister.register(deadBody);
@@ -34,11 +34,11 @@ export class DeadBody extends BaseGameObject {
     vel: Vec2;
     oldPos: Vec2;
 
-    constructor(game: Game, pos: Vec2, playerId: number, layer: number, dir: Vec2) {
+    constructor(game: Game, pos: Vec2, playerId: number, layer: number, dir?: Vec2) {
         super(game, pos);
         this.layer = layer;
         this.playerId = playerId;
-        this.vel = v2.mul(dir, 10);
+        this.vel = v2.mul(dir ?? v2.create(1, 0), 10);
         this.oldPos = v2.copy(this.pos);
     }
 

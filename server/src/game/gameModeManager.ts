@@ -72,7 +72,9 @@ export class GameModeManager {
 
     // used when saving the game match data
     getPlayersSortedByRank(): Array<{ player: Player; rank: number }> {
-        const players = [...this.game.playerBarn.players];
+        const players = this.mode === GameMode.Zombies
+            ? this.game.playerBarn.players.filter((p) => !p.isZombie)
+            : [...this.game.playerBarn.players];
 
         switch (this.mode) {
             case GameMode.Solo:
@@ -202,8 +204,9 @@ export class GameModeManager {
             case GameMode.Team:
                 return player.group!.players;
             case GameMode.Faction:
-            case GameMode.Zombies:
                 return this.game.playerBarn.players;
+            case GameMode.Zombies:
+                return this.game.playerBarn.players.filter((p) => !p.isZombie);
         }
     }
 
@@ -306,7 +309,7 @@ export class GameModeManager {
     }
 
     handlePlayerDeath(player: Player, params: DamageParams): void {
-        if (this.isSolo || (this.mode === GameMode.Zombies && !player.group)) {
+        if (player.isZombie || this.isSolo || (this.mode === GameMode.Zombies && !player.group)) {
             player.kill(params);
         } else {
             const group = this.mode === GameMode.Faction ? player.team! : player.group!;

@@ -295,6 +295,7 @@ export enum MsgType {
     UpdatePass,
     AliveCounts,
     PerkModeRoleSelect,
+    ZombiesNavDebug,
 }
 
 export enum PickupMsgType {
@@ -328,3 +329,9 @@ export { PlayerStatsMsg } from "./playerStatsMsg.ts";
 export { RoleAnnouncementMsg } from "./roleAnnouncementMsg.ts";
 export { SpectateMsg } from "./spectateMsg.ts";
 export { getPlayerStatusUpdateRate, UpdateMsg } from "./updateMsg.ts";
+export {
+    type NavDebugEdge,
+    type NavDebugNode,
+    type NavDebugZombie,
+    ZombiesNavDebugMsg,
+} from "./zombiesNavDebugMsg.ts";

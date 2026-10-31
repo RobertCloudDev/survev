@@ -778,6 +778,7 @@ export class Client {
         // even if they are dead, we only switch to a new player after 2 seconds
         // and not including it in the list will mess up the index for prev/next keybinds
         const shouldSpectate = (p: Player) => {
+            if (p.isZombie) return false;
             if (includeCurrent && p === this.spectating) return true;
             return !p.dead;
         };
@@ -817,7 +818,7 @@ export class Client {
         if (player && !spectateTeam) {
             killer = player.getAliveKiller();
         }
-        if (killer) return killer;
+        if (killer && !killer.isZombie) return killer;
         return this.getSpectablePlayers()[0];
     }
 

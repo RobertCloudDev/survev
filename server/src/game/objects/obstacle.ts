@@ -53,6 +53,7 @@ export class Obstacle extends BaseGameObject {
         return this.button?.canUse ?? this.door?.canUse;
     }
 
+    isBarricade = false;
     isDoor: boolean;
     door?: {
         open: boolean;
@@ -172,6 +173,7 @@ export class Obstacle extends BaseGameObject {
         this.isWindow = def.isWindow ?? false;
         this.isWall = def.isWall ?? false;
         this.isTree = def.isTree ?? false;
+        this.isBarricade = (def as any).isBarricade ?? false;
 
         this.maxHealth = def.health;
         this.health = def.health;
@@ -504,7 +506,12 @@ export class Obstacle extends BaseGameObject {
         const def = MapObjectDefs.typeToDef(this.type, "obstacle");
         this.health = this.healthT = 0;
         this.dead = true;
+        this.collidable = false;
         this.setDirty();
+
+        if (this.game.zombiesManager && (this.isDoor || this.isBarricade || this.destructible)) {
+            this.game.zombiesManager.onDoorStateChanged(this);
+        }
 
         if (params.source?.__type === ObjectType.Player) {
             params.source.questManager.trackEvent("destruction", {
@@ -854,6 +861,10 @@ export class Obstacle extends BaseGameObject {
 
         this.checkLayer();
         this.setDirty();
+
+        if (this.game.zombiesManager) {
+            this.game.zombiesManager.onDoorStateChanged(this);
+        }
     }
 
     openDoor(player?: Player, useDir?: Vec2): void {

@@ -39,6 +39,7 @@ export const debugRendererConfig = {
     loot: false,
     explosions: false,
     rivers: false,
+    zombiesNav: false,
     buildings: {
         buildingBounds: false,
         obstacleBounds: false,

@@ -310,6 +310,7 @@ export class Editor {
                     });
                     bind.on("change", () => {
                         this.config.set(configKey, parentObj as ConfigType[ConfigKey]);
+                        this.sendMsg = true;
                     });
                 }
             }
@@ -386,6 +387,12 @@ export class Editor {
         if (input.keyPressed(Key.Minus)) {
             zoom += 8;
         }
+        if (input.keyPressed(Key.F8)) {
+            this.rendererParams.zombiesNav = !this.rendererParams.zombiesNav;
+            this.rendererParams.enabled = true;
+            this.config.set("debugRenderer", this.rendererParams);
+            this.sendMsg = true;
+        }
 
         zoom = math.clamp(zoom, 1, 255);
         if (zoom !== this.toolParams.zoom) {
@@ -429,6 +436,7 @@ export class Editor {
         msg.godMode = this.toolParams.godMode;
         msg.moveObjs = this.toolParams.moveObjs;
         msg.preventGameStart = this.toolParams.preventGameStart;
+        msg.zombiesNav = this.rendererParams.zombiesNav;
 
         return msg;
     }
