@@ -159,10 +159,14 @@ export class ZombiesUtilityEvaluator {
             const obs = ctx.nearbyObstacleToBreach;
             const isBarricade = !!obs.isBarricade;
             const isClosedDoor = obs.isDoor && obs.door && !obs.door.open;
+            const isOpenDoor = obs.isDoor && obs.door && obs.door.open;
 
             if (isClosedDoor && !obs.door!.locked) {
                 // High immediate utility to open unlocked doors blocking path
-                breachRaw = math.clamp(85.0 * this.weights.breach, 0, 100);
+                breachRaw = math.clamp(95.0 * this.weights.breach, 0, 100);
+            } else if (isOpenDoor && !obs.door!.locked) {
+                // High immediate utility to close open doors blocking path
+                breachRaw = math.clamp(95.0 * this.weights.breach, 0, 100);
             } else if (isBarricade) {
                 // Attack breakable barricade
                 const healthRatio = math.clamp(obs.health / (obs.maxHealth || 40), 0.1, 1.0);
@@ -214,7 +218,10 @@ export class ZombiesUtilityEvaluator {
                 if (!ctx.nearbyObstacleToBreach || ctx.nearbyObstacleToBreach.dead) return false;
                 const obs = ctx.nearbyObstacleToBreach;
                 if (obs.isDoor && obs.door) {
-                    return !obs.door.open && (!obs.door.locked || !!obs.isBarricade);
+                    if (obs.door.open) {
+                        return !obs.door.locked && !!obs.door.canUse;
+                    }
+                    return !obs.door.locked || !!obs.isBarricade;
                 }
                 return !!obs.isBarricade;
             case "pursuit":

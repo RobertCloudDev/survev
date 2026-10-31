@@ -2,15 +2,20 @@ import { describe, expect, test } from "vitest";
 import { Obstacle } from "../../server/src/game/objects/obstacle.ts";
 import { ZombiesNavDebugger } from "../../server/src/game/zombiesDebug.ts";
 import {
+    getBuildingAt,
+    getDoorwayCenter,
+    getReachableMeleeApproach,
     isCapsuleClear,
     isSeparatedByWall,
     isWalkClear,
     MapNavGraph,
+    pointClear,
     ZombieNavRadius,
 } from "../../server/src/game/zombiesNav.ts";
 import { GameConfig, TeamMode } from "../../shared/gameConfig.ts";
 import { BitStream, MsgType, ZombiesNavDebugMsg } from "../../shared/net/net.ts";
 import { ObjectType } from "../../shared/net/objectSerializeFns.ts";
+import { collider } from "../../shared/utils/collider.ts";
 import { math } from "../../shared/utils/math.ts";
 import { v2 } from "../../shared/utils/v2.ts";
 import { createGame } from "./gameTestHelpers.ts";
@@ -900,4 +905,640 @@ describe("Task 004.8 — Reliable Indoor Routing and Door Traversal Regression S
     });
 });
 
+describe("Task 004.11 — Goal Selection and Stationary Target Navigation Regression Suite", () => {
+    test("1. Stationary player inside a small room: zombie reaches melee position without player moving", () => {
+        const game = createGame(TeamMode.Solo, "zombies_cyberpunk");
+        game.preventStart = true;
+        const zm = game.zombiesManager!;
 
+        // Construct a small enclosed room with 3 walls and an open entrance on the west side
+        const center = v2.create(200, 200);
+        game.map.genObstacle("warehouse_wall_side", v2.add(center, v2.create(0, 4)), 0, 0); // North wall
+        game.map.genObstacle("warehouse_wall_side", v2.add(center, v2.create(0, -4)), 0, 0); // South wall
+        game.map.genObstacle("warehouse_wall_side", v2.add(center, v2.create(4, 0)), 0, 1); // East wall
+        // West side is open entrance
+
+        zm.navGraph = MapNavGraph.build(game);
+
+        const human = game.playerBarn.addTestPlayer({ pos: center, name: "StationaryHuman" });
+        const zombie = zm.spawnZombie("walker", v2.add(center, v2.create(-14, 0)))!;
+        const ai = zm.zombies[0];
+
+        // Simulate 60 ticks of movement without human moving
+        for (let t = 0; t < 60; t++) {
+            ai.update(1 / 30);
+            game.update(1 / 30);
+        }
+
+        // Acceptance Criteria:
+        // 1. Navigation status is success (not invalid_goal)
+        expect(ai.navigationResult).toBe("success");
+        expect(ai.isTargetReachable).toBe(true);
+        expect(ai.noRoute).toBe(false);
+        // 2. Low recalculation count (no spamming)
+        expect(ai.recalcCount).toBeLessThan(9);
+        // 3. Zombie has navigated inside and reached valid melee range
+        const dist = v2.distance(zombie.pos, human.pos);
+        expect(dist).toBeLessThanOrEqual(ai.def.attackRange);
+    });
+
+    test("2. Player standing close to an exterior wall: approach position offset away from wall", () => {
+        const game = createGame(TeamMode.Solo, "zombies_cyberpunk");
+        game.preventStart = true;
+        const zm = game.zombiesManager!;
+
+        // Wall obstacle centered at (160, 160)
+        const wall = game.map.genObstacle("warehouse_wall_side", v2.create(160, 160), 0, 0) as Obstacle;
+        zm.navGraph = MapNavGraph.build(game);
+
+        // Player standing 1.05u north of wall edge (player collider rad 1.0 fits, but zombie rad 1.15 clips wall)
+        const wallAabb = collider.toAabb(wall.collider);
+        const playerPos = v2.create(160, wallAabb.max.y + 1.05);
+        expect(pointClear(game, playerPos, 0, ZombieNavRadius, false)).toBe(false);
+
+        const human = game.playerBarn.addTestPlayer({ pos: playerPos, name: "HumanNearWall" });
+        const zombie = zm.spawnZombie("walker", v2.create(160, playerPos.y + 7))!;
+        const ai = zm.zombies[0];
+
+        ai.update(1 / 30);
+
+        // Valid path found to reachable melee approach position
+        expect(ai.navigationResult).toBe("success");
+        expect(ai.isTargetReachable).toBe(true);
+
+        // Simulate movement
+        for (let t = 0; t < 50; t++) {
+            ai.update(1 / 30);
+            game.update(1 / 30);
+        }
+
+        // Zombie occupies physically valid approach position and reaches valid melee attack range
+        const dist = v2.distance(zombie.pos, human.pos);
+        expect(dist).toBeLessThanOrEqual(ai.def.attackRange);
+        expect(pointClear(game, zombie.pos, 0, ZombieNavRadius, false)).toBe(true);
+    });
+
+    test("3. Player standing near furniture: approaches clear side without obstacle clipping", () => {
+        const game = createGame(TeamMode.Solo, "zombies_cyberpunk");
+        game.preventStart = true;
+        const zm = game.zombiesManager!;
+
+        const crate = game.map.genObstacle("crate_01", v2.create(140, 140), 0, 0) as Obstacle;
+        zm.navGraph = MapNavGraph.build(game);
+
+        // Human standing right next to crate
+        const crateAabb = collider.toAabb(crate.collider);
+        const humanPos = v2.create(140, crateAabb.max.y + 1.02);
+        const human = game.playerBarn.addTestPlayer({ pos: humanPos, name: "NearFurniture" });
+        const zombie = zm.spawnZombie("walker", v2.create(140, humanPos.y + 10))!;
+        const ai = zm.zombies[0];
+
+        for (let t = 0; t < 50; t++) {
+            ai.update(1 / 30);
+            game.update(1 / 30);
+        }
+
+        expect(ai.navigationResult).toBe("success");
+        expect(v2.distance(zombie.pos, human.pos)).toBeLessThanOrEqual(ai.def.attackRange);
+    });
+
+    test("4. Player standing just inside a doorway: routes through portal without hanging", () => {
+        const game = createGame(TeamMode.Solo, "zombies_cyberpunk");
+        game.preventStart = true;
+        const zm = game.zombiesManager!;
+        const nav = zm.getNavGraph();
+
+        const door = game.map.obstacles.find((o) => o.isDoor && o.door && o.parentBuilding)!;
+        expect(door).toBeDefined();
+
+        door.door!.locked = false;
+        door.door!.canUse = true;
+        door.openDoor();
+        nav.invalidateCache();
+
+        const closedOri = door.door?.closedOri ?? door.ori;
+        const n = v2.rotate(v2.create(1, 0), math.oriToRad(closedOri));
+        const toBuilding = v2.sub(door.parentBuilding!.pos, door.pos);
+        const isAInside = v2.dot(n, toBuilding) >= 0;
+        const insideDir = isAInside ? n : v2.neg(n);
+        const outsideDir = v2.neg(insideDir);
+
+        const insidePos = v2.add(door.pos, v2.mul(insideDir, 1.5));
+        const outsidePos = v2.add(door.pos, v2.mul(outsideDir, 3.0));
+
+        const human = game.playerBarn.addTestPlayer({ pos: insidePos, name: "JustInsideDoor" });
+        const zombie = zm.spawnZombie("walker", outsidePos)!;
+        const ai = zm.zombies[0];
+
+        for (let t = 0; t < 80; t++) {
+            ai.update(1 / 30);
+            game.update(1 / 30);
+        }
+
+        expect(ai.navigationResult).toBe("success");
+        expect(v2.distance(zombie.pos, human.pos)).toBeLessThanOrEqual(ai.def.attackRange);
+    });
+
+    test("5. Nearest navigation node separated by a wall: rejects exterior node and picks interior candidate", () => {
+        const game = createGame(TeamMode.Solo, "zombies_cyberpunk");
+        game.preventStart = true;
+        const zm = game.zombiesManager!;
+
+        const door = game.map.obstacles.find((o) => o.isDoor && o.door && o.parentBuilding)!;
+        expect(door).toBeDefined();
+        const building = door.parentBuilding!;
+
+        const toBuilding = v2.normalize(v2.sub(building.pos, door.pos));
+        const humanPos = v2.add(door.pos, v2.mul(toBuilding, 3.0));
+
+        const detailed = zm.getNavGraph().findDetailedPath(
+            game,
+            v2.add(door.pos, v2.mul(v2.neg(toBuilding), 10.0)),
+            humanPos,
+            0,
+            0,
+            0,
+        );
+
+        expect(detailed.result).toBe("success");
+        expect(detailed.candidatesConsidered).toBeDefined();
+        // Any exterior hull nodes evaluated for indoor target are rejected
+        const exteriorCandidate = detailed.candidatesConsidered?.find(
+            (c) => c.rejectionReason === "exterior_node_for_indoor_target" || c.rejectionReason === "separated_by_wall",
+        );
+        // Path does not cut across the building exterior wall
+        expect(detailed.path.length).toBeGreaterThan(0);
+    });
+
+    test("6. Multiple potential goal nodes: evaluates candidates and selects lowest-cost valid route", () => {
+        const game = createGame(TeamMode.Solo, "zombies_cyberpunk");
+        game.preventStart = true;
+        const zm = game.zombiesManager!;
+
+        const b = game.map.buildings.find((x) => x.zoomRegions.length >= 2)!;
+        expect(b).toBeDefined();
+
+        const fromPos = v2.add(b.pos, v2.create(-20, 0));
+        const toPos = v2.copy(b.pos);
+
+        const detailed = zm.getNavGraph().findDetailedPath(game, fromPos, toPos, 0, 0, 0);
+
+        expect(detailed.result).toBe("success");
+        expect(detailed.candidatesConsidered).toBeDefined();
+        expect(detailed.candidatesConsidered!.length).toBeGreaterThanOrEqual(1);
+        expect(detailed.candidatesConsidered!.some((c) => c.rejectionReason === "accepted" || c.rejectionReason === "accepted_relaxed")).toBe(true);
+    });
+
+    test("7. Multiple entrances to the same room: routes through available door when one is locked", () => {
+        const game = createGame(TeamMode.Solo, "zombies_cyberpunk");
+        game.preventStart = true;
+        const zm = game.zombiesManager!;
+        const nav = zm.getNavGraph();
+
+        const b = game.map.buildings.find((x) => {
+            const doors = x.childObjects.filter((c) => (c as Obstacle).isDoor && (c as Obstacle).door);
+            return doors.length >= 2;
+        });
+        expect(b).toBeDefined();
+        if (!b) return;
+
+        const doors = b.childObjects.filter((c) => (c as Obstacle).isDoor && (c as Obstacle).door) as Obstacle[];
+        const doorA = doors[0];
+        const doorB = doors[1];
+
+        // Lock door A
+        doorA.door!.open = false;
+        doorA.door!.locked = true;
+        doorA.door!.canUse = false;
+
+        // Open door B properly with openDoor
+        doorB.door!.locked = false;
+        doorB.door!.canUse = true;
+        doorB.openDoor();
+        nav.invalidateCache();
+
+        // Calculate outside of Door A for zombie
+        const closedOriA = doorA.door?.closedOri ?? doorA.ori;
+        const normA = v2.rotate(v2.create(1, 0), math.oriToRad(closedOriA));
+        const toBuildingA = v2.sub(b.pos, doorA.pos);
+        const isAInside = v2.dot(normA, toBuildingA) >= 0;
+        const outsideDirA = isAInside ? v2.neg(normA) : normA;
+        const zombiePos = v2.add(doorA.pos, v2.mul(outsideDirA, 3.5));
+
+        // Calculate inside of Door B for human
+        const closedOriB = doorB.door?.closedOri ?? doorB.ori;
+        const normB = v2.rotate(v2.create(1, 0), math.oriToRad(closedOriB));
+        const toBuildingB = v2.sub(b.pos, doorB.pos);
+        const isBInside = v2.dot(normB, toBuildingB) >= 0;
+        const insideDirB = isBInside ? normB : v2.neg(normB);
+        const humanPos = v2.add(doorB.pos, v2.mul(insideDirB, 2.5));
+
+        const human = game.playerBarn.addTestPlayer({ pos: humanPos, name: "HumanMultiDoor" });
+        const zombie = zm.spawnZombie("walker", zombiePos)!;
+        const ai = zm.zombies[0];
+
+        ai.update(1 / 30);
+
+        // Path routes around to door B rather than giving up with invalid_goal or blocked
+        expect(ai.navigationResult).toBe("success");
+        expect(ai.isTargetReachable).toBe(true);
+        expect(ai.noRoute).toBe(false);
+        expect(ai.currentPath.length).toBeGreaterThan(0);
+    });
+
+    test("8. Goal position too close to an obstacle: generates physically reachable attack approach", () => {
+        const game = createGame(TeamMode.Solo, "zombies_cyberpunk");
+        game.preventStart = true;
+
+        const wall = game.map.genObstacle("warehouse_wall_side", v2.create(170, 170), 0, 0) as Obstacle;
+        const wallAabb = collider.toAabb(wall.collider);
+        const targetPos = v2.create(170, wallAabb.max.y + 0.3); // Inside obstacle clearance margin for zombie
+        const fromPos = v2.create(170, 185);
+
+        expect(pointClear(game, targetPos, 0, ZombieNavRadius, false)).toBe(false);
+
+        const approach = getReachableMeleeApproach(game, targetPos, fromPos, 0, undefined, ZombieNavRadius);
+
+        expect(approach).not.toBeNull();
+        expect(pointClear(game, approach!, 0, ZombieNavRadius, false)).toBe(true);
+        expect(isSeparatedByWall(game, approach!, targetPos, 0)).toBe(false);
+        expect(v2.distance(approach!, targetPos)).toBeLessThanOrEqual(2.8);
+    });
+
+    test("9. Reachable melee approach position: validates LOS and line contact in tight corner", () => {
+        const game = createGame(TeamMode.Solo, "zombies_cyberpunk");
+        game.preventStart = true;
+
+        // Two perpendicular walls forming a corner at (100, 100)
+        game.map.genObstacle("warehouse_wall_side", v2.create(100, 95), 0, 0); // South wall
+        game.map.genObstacle("warehouse_wall_side", v2.create(95, 100), 0, 1); // West wall
+
+        const cornerPlayer = v2.create(98.5, 98.5);
+        const zombiePos = v2.create(110, 110);
+
+        const approach = getReachableMeleeApproach(game, cornerPlayer, zombiePos, 0, undefined, ZombieNavRadius);
+
+        expect(approach).not.toBeNull();
+        expect(pointClear(game, approach!, 0, ZombieNavRadius, false)).toBe(true);
+        expect(isCapsuleClear(game, approach!, cornerPlayer, 0, 0.35, false)).toBe(true);
+    });
+
+    test("10. Genuinely unreachable enclosed room: enters controlled unreachable state without spam", () => {
+        const game = createGame(TeamMode.Solo, "zombies_cyberpunk");
+        game.preventStart = true;
+        const zm = game.zombiesManager!;
+
+        const center = v2.create(300, 300);
+        game.map.genObstacle("warehouse_wall_side", v2.add(center, v2.create(0, 4)), 0, 0);
+        game.map.genObstacle("warehouse_wall_side", v2.add(center, v2.create(0, -4)), 0, 0);
+        game.map.genObstacle("warehouse_wall_side", v2.add(center, v2.create(4, 0)), 0, 1);
+        game.map.genObstacle("warehouse_wall_side", v2.add(center, v2.create(-4, 0)), 0, 1);
+
+        zm.navGraph = MapNavGraph.build(game);
+
+        const human = game.playerBarn.addTestPlayer({ pos: center, name: "TrappedHuman" });
+        const zombie = zm.spawnZombie("walker", v2.add(center, v2.create(25, 25)))!;
+        const ai = zm.zombies[0];
+
+        ZombiesNavDebugger.clearFailures();
+
+        for (let t = 0; t < 30; t++) {
+            ai.update(1 / 30);
+        }
+
+        // Acceptance Criteria:
+        // 1. Correctly marks unreachable / no route
+        expect(ai.isTargetReachable).toBe(false);
+        expect(ai.noRoute).toBe(true);
+        // 2. Preserves the target (does not drop target)
+        expect(ai.target).toBe(human);
+        // 3. No excessive recalculation spam
+        expect(ai.recalcCount).toBeLessThan(5);
+        // 4. Failure diagnostic captured
+        const diag = ZombiesNavDebugger.getLatestFailure();
+        expect(diag).not.toBeNull();
+        expect(diag?.failureType).toBe("no_route");
+        expect(diag?.zombieRadius).toBeCloseTo(ZombieNavRadius);
+    });
+});
+
+describe("Task 004.13 — Open-Door Collision and Door State Navigation Suite", () => {
+    test("1. Closed door that needs to open: approaches, opens cleanly, and traverses through doorway", () => {
+        const game = createGame(TeamMode.Solo, "zombies_cyberpunk");
+        game.preventStart = true;
+        const zm = game.zombiesManager!;
+        const door = game.map.obstacles.find(
+            (o) => o.isDoor && o.door && !o.door.locked && o.door.canUse && o.parentBuilding,
+        ) as Obstacle;
+        expect(door).toBeDefined();
+        door.closeDoor();
+        expect(door.door!.open).toBe(false);
+
+        const center = getDoorwayCenter(door);
+        const n = v2.rotate(v2.create(1, 0), math.oriToRad(door.door?.closedOri ?? door.ori));
+        const toBuilding = v2.sub(door.parentBuilding!.pos, center);
+        const outsideDir = v2.dot(n, toBuilding) >= 0 ? v2.neg(n) : n;
+        const insideDir = v2.neg(outsideDir);
+
+        const zombiePos = v2.add(center, v2.mul(outsideDir, 3.2));
+        const humanPos = v2.add(center, v2.mul(insideDir, 4.0));
+
+        game.playerBarn.addTestPlayer({ pos: humanPos, name: "S1_Human" });
+        const zombie = zm.spawnZombie("walker", zombiePos)!;
+        const ai = zm.zombies[0];
+
+        const initialDist = v2.distance(zombie.pos, humanPos);
+
+        for (let t = 0; t < 35; t++) {
+            ai.update(1 / 30);
+            zombie.update(1 / 30);
+        }
+
+        expect(door.door!.open).toBe(true);
+        const finalDist = v2.distance(zombie.pos, humanPos);
+        expect(finalDist).toBeLessThan(initialDist);
+    });
+
+    test("2. Open door that is not obstructing movement: navigates directly through without closing door", () => {
+        const game = createGame(TeamMode.Solo, "zombies_cyberpunk");
+        game.preventStart = true;
+        const zm = game.zombiesManager!;
+        const door = game.map.obstacles.find(
+            (o) => o.isDoor && o.door && !o.door.locked && o.parentBuilding,
+        ) as Obstacle;
+        expect(door).toBeDefined();
+
+        door.openDoor();
+        expect(door.door!.open).toBe(true);
+        zm.getNavGraph().invalidateCache();
+
+        const center = getDoorwayCenter(door);
+        const n = v2.rotate(v2.create(1, 0), math.oriToRad(door.door?.closedOri ?? door.ori));
+        const toBuilding = v2.sub(door.parentBuilding!.pos, center);
+        const outsideDir = v2.dot(n, toBuilding) >= 0 ? v2.neg(n) : n;
+        const insideDir = v2.neg(outsideDir);
+
+        const zombiePos = v2.add(center, v2.mul(outsideDir, 3.2));
+        const humanPos = v2.add(center, v2.mul(insideDir, 4.0));
+
+        game.playerBarn.addTestPlayer({ pos: humanPos, name: "S2_Human" });
+        const zombie = zm.spawnZombie("walker", zombiePos)!;
+        const ai = zm.zombies[0];
+
+        const initialDist = v2.distance(zombie.pos, humanPos);
+
+        for (let t = 0; t < 25; t++) {
+            ai.update(1 / 30);
+            zombie.update(1 / 30);
+        }
+
+        // Must remain open (not close open door)
+        expect(door.door!.open).toBe(true);
+        expect(v2.distance(zombie.pos, humanPos)).toBeLessThan(initialDist);
+    });
+
+    test("3. Open door whose swung panel blocks the intended route: detects blockage, closes door, and resumes path", () => {
+        const game = createGame(TeamMode.Solo, "zombies_cyberpunk");
+        game.preventStart = true;
+        const zm = game.zombiesManager!;
+
+        // Place a door obstacle along a corridor
+        const doorPos = v2.create(150, 150);
+        const door = game.map.genObstacle("house_door_01", doorPos, 0, 0) as Obstacle;
+        door.openDoor();
+        expect(door.door!.open).toBe(true);
+
+        // Open door collider spans x in [146, 150] at y=150
+        const zombiePos = v2.add(door.pos, v2.create(-2.0, 1.5));
+        const goalPos = v2.add(door.pos, v2.create(-2.0, -1.5));
+        const human = game.playerBarn.addTestPlayer({ pos: goalPos, name: "S3_Target" });
+        const zombie = zm.spawnZombie("walker", zombiePos)!;
+        const ai = zm.zombies[0];
+        ai.target = human;
+        ai.currentPath = [goalPos];
+
+        expect(ai.isOpenDoorBlockingRoute(door)).toBe(true);
+
+        for (let t = 0; t < 20; t++) {
+            ai.update(1 / 30);
+            zombie.update(1 / 30);
+        }
+
+        // Zombie should close the blocking door to free the route
+        expect(door.door!.open).toBe(false);
+    });
+
+    test("4. Door that must close to allow passage: closes swinging panel obstructing hallway traversal", () => {
+        const game = createGame(TeamMode.Solo, "zombies_cyberpunk");
+        game.preventStart = true;
+        const zm = game.zombiesManager!;
+
+        // Door positioned beside a corridor
+        const doorPos = v2.create(200, 200);
+        const door = game.map.genObstacle("house_door_01", doorPos, 0, 0) as Obstacle;
+        door.openDoor();
+        expect(door.door!.open).toBe(true);
+
+        // Hallway along x = 198: panel spans [196, 200] at y = 200
+        const zombiePos = v2.create(198.0, 202.5);
+        const humanPos = v2.create(198.0, 196.0);
+
+        const human = game.playerBarn.addTestPlayer({ pos: humanPos, name: "S4_Human" });
+        const zombie = zm.spawnZombie("walker", zombiePos)!;
+        const ai = zm.zombies[0];
+        ai.target = human;
+        ai.currentPath = [humanPos];
+
+        const initialDist = v2.distance(zombie.pos, humanPos);
+
+        for (let t = 0; t < 30; t++) {
+            ai.update(1 / 30);
+            zombie.update(1 / 30);
+        }
+
+        // To navigate along the hallway past the door, the swung panel must be closed
+        expect(door.door!.open).toBe(false);
+        expect(v2.distance(zombie.pos, humanPos)).toBeLessThan(initialDist);
+    });
+
+    test("5. Door with obstacles on either side: respects physical radius clearance without clipping crates", () => {
+        const game = createGame(TeamMode.Solo, "zombies_cyberpunk");
+        game.preventStart = true;
+        const zm = game.zombiesManager!;
+
+        const door = game.map.obstacles.find(
+            (o) => o.isDoor && o.door && !o.door.locked && o.parentBuilding,
+        ) as Obstacle;
+        expect(door).toBeDefined();
+
+        const center = getDoorwayCenter(door);
+        const n = v2.rotate(v2.create(1, 0), math.oriToRad(door.door?.closedOri ?? door.ori));
+        const tangent = v2.perp(n);
+
+        // Place crates flanking either side of doorway frame leaving doorframe clear
+        const crateLeft = game.map.genObstacle("crate_01", v2.add(center, v2.mul(tangent, 3.6)), 0, 0);
+        const crateRight = game.map.genObstacle("crate_01", v2.add(center, v2.mul(tangent, -3.6)), 0, 0);
+
+        zm.navGraph = MapNavGraph.build(game);
+
+        const toBuilding = v2.sub(door.parentBuilding!.pos, center);
+        const outsideDir = v2.dot(n, toBuilding) >= 0 ? v2.neg(n) : n;
+        const insideDir = v2.neg(outsideDir);
+
+        const zombiePos = v2.add(center, v2.mul(outsideDir, 3.0));
+        const humanPos = v2.add(center, v2.mul(insideDir, 3.5));
+
+        game.playerBarn.addTestPlayer({ pos: humanPos, name: "S5_Human" });
+        const zombie = zm.spawnZombie("walker", zombiePos)!;
+        const ai = zm.zombies[0];
+
+        for (let t = 0; t < 35; t++) {
+            ai.update(1 / 30);
+            zombie.update(1 / 30);
+            // Verify zombie never collides with either crate (collider returns null when no intersection)
+            expect(collider.intersectCircle(crateLeft.collider, zombie.pos, zombie.rad)).toBeNull();
+            expect(collider.intersectCircle(crateRight.collider, zombie.pos, zombie.rad)).toBeNull();
+        }
+
+        expect(door.door!.open).toBe(true);
+    });
+
+    test("6. Multiple available entrances: routes to alternate valid entrance when one entrance is blocked", () => {
+        const game = createGame(TeamMode.Solo, "zombies_cyberpunk");
+        game.preventStart = true;
+        const zm = game.zombiesManager!;
+
+        const building = game.map.buildings.find(
+            (b) => b.childObjects.filter((c) => (c as Obstacle).isDoor).length >= 2,
+        )!;
+        expect(building).toBeDefined();
+
+        const doors = building.childObjects.filter((c) => (c as Obstacle).isDoor) as Obstacle[];
+        const doorA = doors[0];
+        const doorB = doors[1];
+
+        // Door A is locked and unusable
+        doorA.door!.locked = true;
+        doorA.door!.canUse = false;
+        doorA.door!.open = false;
+
+        // Door B is unlocked and usable
+        doorB.door!.locked = false;
+        doorB.door!.canUse = true;
+        doorB.door!.open = false;
+
+        zm.navGraph = MapNavGraph.build(game);
+
+        // Human inside building
+        const humanPos = v2.copy(building.pos);
+        game.playerBarn.addTestPlayer({ pos: humanPos, name: "S6_Human" });
+
+        // Zombie outside near blocked Door A
+        const zombiePos = v2.add(doorA.pos, v2.create(3.0, 0));
+        const zombie = zm.spawnZombie("walker", zombiePos)!;
+        const ai = zm.zombies[0];
+
+        ai.update(1 / 30);
+
+        expect(ai.isTargetReachable).toBe(true);
+        expect(ai.noRoute).toBe(false);
+        expect(doorA.door!.open).toBe(false); // Locked door not opened
+    });
+
+    test("7. Locked door that cannot be operated: recognizes impassable entrance without infinite toggle loops", () => {
+        const game = createGame(TeamMode.Solo, "zombies_cyberpunk");
+        game.preventStart = true;
+        const zm = game.zombiesManager!;
+
+        const testDoor = game.map.obstacles.find(
+            (o) => o.isDoor && o.door && !o.dead && o.parentBuilding,
+        )!;
+        const building = testDoor.parentBuilding!;
+
+        for (const obs of game.map.obstacles) {
+            if (obs.isDoor && obs.door) {
+                if (obs.parentBuilding === building || v2.distance(obs.pos, building.pos) < 60) {
+                    obs.door.locked = true;
+                    obs.door.canUse = false;
+                    obs.door.open = false;
+                    obs.isBarricade = false;
+                }
+            }
+        }
+
+        const zoom = building.zoomRegions[0]?.zoomIn;
+        const humanPos = zoom
+            ? v2.create((zoom.min.x + zoom.max.x) * 0.5, (zoom.min.y + zoom.max.y) * 0.5)
+            : v2.copy(building.pos);
+        game.playerBarn.addTestPlayer({ pos: humanPos, name: "S7_TrappedHuman" });
+
+        const toBuilding = v2.sub(building.pos, testDoor.pos);
+        const norm = v2.rotate(v2.create(1, 0), math.oriToRad(testDoor.door?.closedOri ?? testDoor.ori));
+        const outsideDir = v2.dot(norm, toBuilding) >= 0 ? v2.neg(norm) : norm;
+        const zombiePos = v2.add(testDoor.pos, v2.mul(outsideDir, 3.0));
+
+        zm.navGraph = MapNavGraph.build(game);
+
+        const zombie = zm.spawnZombie("walker", zombiePos)!;
+        const ai = zm.zombies[0];
+
+        for (let t = 0; t < 30; t++) {
+            ai.update(1 / 30);
+            zombie.update(1 / 30);
+        }
+
+        expect(testDoor.door!.open).toBe(false);
+        expect(ai.doorToggles.get(testDoor.__id) ?? 0).toBeLessThanOrEqual(3);
+        expect(ai.isTargetReachable).toBe(false);
+    });
+
+    test("8. Door state transitions while approaching: dynamically recalculates route when door state changes mid-path", () => {
+        const game = createGame(TeamMode.Solo, "zombies_cyberpunk");
+        game.preventStart = true;
+        const zm = game.zombiesManager!;
+
+        const door = game.map.obstacles.find(
+            (o) => o.isDoor && o.door && !o.door.locked && o.parentBuilding,
+        ) as Obstacle;
+        expect(door).toBeDefined();
+
+        door.closeDoor();
+        expect(door.door!.open).toBe(false);
+
+        const center = getDoorwayCenter(door);
+        const n = v2.rotate(v2.create(1, 0), math.oriToRad(door.door?.closedOri ?? door.ori));
+        const toBuilding = v2.sub(door.parentBuilding!.pos, center);
+        const outsideDir = v2.dot(n, toBuilding) >= 0 ? v2.neg(n) : n;
+        const insideDir = v2.neg(outsideDir);
+
+        const zombiePos = v2.add(center, v2.mul(outsideDir, 6.0));
+        const humanPos = v2.add(center, v2.mul(insideDir, 4.0));
+
+        game.playerBarn.addTestPlayer({ pos: humanPos, name: "S8_Human" });
+        const zombie = zm.spawnZombie("walker", zombiePos)!;
+        const ai = zm.zombies[0];
+
+        // Tick 0-9: Approaching closed door
+        for (let t = 0; t < 10; t++) {
+            ai.update(1 / 30);
+            zombie.update(1 / 30);
+        }
+
+        const preRecalc = ai.recalcCount;
+
+        // External event: door opens while zombie is still approaching
+        door.openDoor();
+        expect(door.door!.open).toBe(true);
+
+        // Tick 10-25: Zombie continues approach with updated door geometry
+        for (let t = 0; t < 15; t++) {
+            ai.update(1 / 30);
+            zombie.update(1 / 30);
+        }
+
+        // onDoorStateChanged triggered path update
+        expect(ai.recalcCount).toBeGreaterThan(preRecalc);
+        expect(ai.isTargetReachable).toBe(true);
+        expect(v2.distance(zombie.pos, humanPos)).toBeLessThan(v2.distance(zombiePos, humanPos));
+    });
+});

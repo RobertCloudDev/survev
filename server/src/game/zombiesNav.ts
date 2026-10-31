@@ -1,3 +1,4 @@
+import { MapObjectDefs } from "../../../shared/defs/register.ts";
 import { ObjectType } from "../../../shared/net/objectSerializeFns.ts";
 import { coldet, type Collider } from "../../../shared/utils/coldet.ts";
 import { collider } from "../../../shared/utils/collider.ts";
@@ -19,10 +20,20 @@ export type NavigationResult =
     | "invalid_start"
     | "invalid_goal";
 
+export interface CandidateGoalReport {
+    id: number;
+    kind: string;
+    pos: Vec2;
+    dist: number;
+    rejectionReason: string;
+}
+
 export interface DetailedPathResult {
     result: NavigationResult;
     path: Vec2[];
     failureReason: string;
+    approachPos?: Vec2 | null;
+    candidatesConsidered?: CandidateGoalReport[];
 }
 
 export interface NavNode {
@@ -49,7 +60,7 @@ const GridStep = 14;
 const LinkRadius = 18;
 const StairLinkRadius = 42;
 const MaxExtraLinks = 10;
-const InteriorGridStep = 2.4;
+const InteriorGridStep = 1.6;
 const PathNearbyRadius = 24;
 const PathNearbyStairRadius = 28;
 
@@ -151,8 +162,6 @@ export function isCapsuleClear(
             if (ignoreDoors) {
                 if (isBarricade) continue;
                 if (!o.door?.locked && o.door?.canUse) continue;
-            } else {
-                if (o.door?.open) continue;
             }
         }
 
@@ -253,11 +262,27 @@ export function isSeparatedByWall(game: Game, from: Vec2, to: Vec2, layer: numbe
         const isWallBarrier = o.isWall || o.type.includes("wall") || (o.isDoor && (o.door?.locked || !o.door?.canUse));
         if (!isWallBarrier) continue;
 
-        // If an endpoint is already inside this obstacle, the obstacle is not a barrier between them
-        if (isPointInsideCollider(o.collider, from) || isPointInsideCollider(o.collider, to)) continue;
+        if (o.collider.type === collider.Type.Aabb) {
+            const min = o.collider.min;
+            const max = o.collider.max;
+            if (!coldet.intersectSegmentAabb(from, to, min, max)) continue;
 
-        if (collider.intersectSegment(o.collider, from, to)) {
-            return true;
+            // Check if segment truly crosses the wall from one side to the other,
+            // or if the midpoint penetrates inside the solid wall
+            const crossesX = (from.x <= min.x + 1e-4 && to.x >= max.x - 1e-4)
+                || (from.x >= max.x - 1e-4 && to.x <= min.x + 1e-4);
+            const crossesY = (from.y <= min.y + 1e-4 && to.y >= max.y - 1e-4)
+                || (from.y >= max.y - 1e-4 && to.y <= min.y + 1e-4);
+            const mid = v2.mul(v2.add(from, to), 0.5);
+            const midInside = mid.x > min.x && mid.x < max.x && mid.y > min.y && mid.y < max.y;
+
+            if (crossesX || crossesY || midInside) {
+                return true;
+            }
+        } else {
+            if (collider.intersectSegment(o.collider, from, to)) {
+                return true;
+            }
         }
     }
     return false;
@@ -279,8 +304,6 @@ export function isLineClear(
         if (o.isDoor) {
             if (ignoreDoors) {
                 if (!o.door?.locked && o.door?.canUse) continue;
-            } else {
-                if (o.door?.open) continue;
             }
         }
         if (collider.intersectSegment(o.collider, from, to)) {
@@ -292,16 +315,96 @@ export function isLineClear(
 
 export function getBuildingAt(game: Game, pos: Vec2): Building | undefined {
     const buildings = game.map.buildings;
+    // 1. Zoom regions check with radius tolerance (1.2u for player collider boundary)
     for (let i = 0; i < buildings.length; i++) {
         const b = buildings[i];
         for (let j = 0; j < b.zoomRegions.length; j++) {
             const z = b.zoomRegions[j].zoomIn;
-            if (z && coldet.testPointAabb(pos, z.min, z.max)) {
+            if (z && (coldet.testPointAabb(pos, z.min, z.max) || coldet.testCircleAabb(pos, 1.2, z.min, z.max))) {
+                return b;
+            }
+        }
+    }
+    // 2. Footprint / hull fallback
+    for (let i = 0; i < buildings.length; i++) {
+        const b = buildings[i];
+        const hull = buildingHull(b);
+        if (hull && coldet.testPointAabb(pos, hull.min, hull.max)) {
+            const ground = util.toGroundLayer(b.layer);
+            if (!isSeparatedByWall(game, pos, b.pos, ground)) {
                 return b;
             }
         }
     }
     return undefined;
+}
+
+/**
+ * Generates a physically reachable melee approach position for pursuit.
+ * Selects a position within valid melee attack range from which the zombie collider
+ * can occupy without clipping walls/obstacles and has unobstructed line-of-sight to the target.
+ */
+export function getReachableMeleeApproach(
+    game: Game,
+    targetPos: Vec2,
+    fromPos: Vec2,
+    layer: number,
+    targetBuilding?: Building,
+    zombieRad = ZombieNavRadius,
+): Vec2 | null {
+    const targetB = targetBuilding ?? getBuildingAt(game, targetPos);
+
+    // If target position itself already has full physical clearance for the zombie,
+    // targetPos itself is the ideal navigation destination (no offset needed).
+    if (pointClear(game, targetPos, layer, zombieRad, false)) {
+        return targetPos;
+    }
+
+    // Direction from target towards zombie (prefer approach on zombie's incoming side)
+    const toZombie = v2.sub(fromPos, targetPos);
+    const baseAngle = v2.length(toZombie) > 0.01 ? Math.atan2(toZombie.y, toZombie.x) : 0;
+
+    // Distances to test: melee attack range is ~2.5 - 2.8u; zombie radius is 1.15u, player radius 1.0u
+    const distances = [1.8, 2.1, 2.4, 2.7, 1.5];
+
+    // 16 radial directions around target, sorted starting from facing the zombie
+    const angleOffsets: number[] = [0];
+    for (let step = 1; step <= 8; step++) {
+        const offset = (step * Math.PI) / 8;
+        angleOffsets.push(offset);
+        if (step < 8) angleOffsets.push(-offset);
+    }
+
+    for (let d = 0; d < distances.length; d++) {
+        const dist = distances[d];
+        for (let a = 0; a < angleOffsets.length; a++) {
+            const angle = baseAngle + angleOffsets[a];
+            const pt = v2.add(targetPos, v2.mul(v2.create(Math.cos(angle), Math.sin(angle)), dist));
+            game.map.clampToMapBounds(pt, 2);
+
+            // 1. Must match target's building / room classification
+            if (targetB) {
+                const ptB = getBuildingAt(game, pt);
+                if (ptB?.__id !== targetB.__id) continue;
+            } else {
+                const ptB = getBuildingAt(game, pt);
+                if (ptB !== undefined) continue;
+            }
+
+            // 2. Must not be separated from target by a solid wall
+            if (isSeparatedByWall(game, pt, targetPos, layer)) continue;
+
+            // 3. Zombie physical collider must be able to occupy pt without clipping
+            if (!pointClear(game, pt, layer, zombieRad, false)) continue;
+
+            // 4. Must have unobstructed attack contact to target
+            if (!isLineClear(game, pt, targetPos, layer, false)) continue;
+
+            return pt;
+        }
+    }
+
+    return null;
 }
 
 export function inferGroundLayer(game: Game, pos: Vec2, fallback: number): number {
@@ -337,9 +440,20 @@ export function stairAtPos(
     return undefined;
 }
 
-function doorNormal(door: Obstacle): Vec2 {
+export function doorNormal(door: Obstacle): Vec2 {
     const ori = door.door?.closedOri ?? door.ori;
     return v2.rotate(v2.create(1, 0), math.oriToRad(ori));
+}
+
+export function getDoorwayCenter(door: Obstacle): Vec2 {
+    if (!door.door) return v2.copy(door.pos);
+    const def = MapObjectDefs.typeToDef(door.type, "obstacle");
+    if (!def?.collision) return v2.copy(door.pos);
+    const closedOri = door.door.closedOri ?? door.ori;
+    const closedRot = math.oriToRad(closedOri);
+    const closedColl = collider.transform(def.collision, door.pos, closedRot, door.scale);
+    const aabb = collider.toAabb(closedColl);
+    return v2.mul(v2.add(aabb.min, aabb.max), 0.5);
 }
 
 function aabbCenter(aabb: NavAabb): Vec2 {
@@ -406,6 +520,8 @@ export class MapNavGraph {
     private pathCache = new Map<string, Vec2[] | null>();
     lastFailureReason = "none";
 
+    lastCandidateGoalReports: CandidateGoalReport[] = [];
+
     static build(game: Game): MapNavGraph {
         const graph = new MapNavGraph();
         graph.sample(game);
@@ -444,13 +560,18 @@ export class MapNavGraph {
         toLayer: number,
         rawLayer = fromLayer,
         edgePenalties?: Map<string, number>,
+        approachPos?: Vec2 | null,
     ): DetailedPathResult {
-        const waypoints = this.path(game, from, to, fromLayer, toLayer, rawLayer, edgePenalties);
+        const waypoints = this.path(game, from, to, fromLayer, toLayer, rawLayer, edgePenalties, approachPos);
+        const candidates = this.lastCandidateGoalReports;
+
         if (waypoints && waypoints.length > 0) {
             return {
                 result: "success",
                 path: waypoints,
                 failureReason: "none",
+                approachPos,
+                candidatesConsidered: candidates,
             };
         }
 
@@ -467,6 +588,8 @@ export class MapNavGraph {
             result,
             path: [],
             failureReason: this.lastFailureReason,
+            approachPos,
+            candidatesConsidered: candidates,
         };
     }
 
@@ -478,15 +601,17 @@ export class MapNavGraph {
         toLayer: number,
         rawLayer = fromLayer,
         edgePenalties?: Map<string, number>,
+        approachPos?: Vec2 | null,
     ): Vec2[] | null {
+        const effectiveGoal = approachPos ?? to;
         const hasPenalties = edgePenalties !== undefined && edgePenalties.size > 0;
-        const cacheKey = this.cacheKey(from, to, fromLayer, toLayer);
+        const cacheKey = this.cacheKey(from, effectiveGoal, fromLayer, toLayer);
         if (!hasPenalties) {
             const cached = this.pathCache.get(cacheKey);
             if (cached !== undefined) return cached;
         }
 
-        const targetBuilding = getBuildingAt(game, to);
+        const targetBuilding = getBuildingAt(game, to) ?? getBuildingAt(game, effectiveGoal);
         const startBuilding = getBuildingAt(game, from);
 
         // Immediate direct clear line check if in same environment and ground layer
@@ -494,9 +619,9 @@ export class MapNavGraph {
         if (
             fromLayer === toLayer
             && targetBuilding === startBuilding
-            && isCapsuleClear(game, from, to, fromLayer, ZombieNavRadius, false)
+            && isCapsuleClear(game, from, effectiveGoal, fromLayer, ZombieNavRadius, false)
         ) {
-            const direct = [v2.copy(to)];
+            const direct = [v2.copy(effectiveGoal)];
             if (!hasPenalties) this.remember(cacheKey, direct);
             return direct;
         }
@@ -507,7 +632,9 @@ export class MapNavGraph {
         const startRadius = onStair ? PathNearbyStairRadius : PathNearbyRadius;
 
         const starts = this.findValidStarts(game, from, fromLayer, startRadius, onStair, startBuilding?.__id);
-        const ends = this.findValidEnds(game, to, toLayer, PathNearbyRadius, targetBuilding?.__id);
+        const endsResult = this.findValidEnds(game, to, toLayer, PathNearbyRadius, targetBuilding?.__id, approachPos);
+        const ends = endsResult.ends;
+        this.lastCandidateGoalReports = endsResult.candidates;
 
         if (!starts.length) {
             this.lastFailureReason = "no_start_nodes";
@@ -533,7 +660,7 @@ export class MapNavGraph {
             const g = v2.distance(from, node.pos);
             const layerPenalty = node.layer === toLayer ? 0 : (node.kind === "stair" ? 4 : 10);
             gScore.set(node.id, g);
-            heap.push(node.id, g + v2.distance(node.pos, to) + layerPenalty);
+            heap.push(node.id, g + v2.distance(node.pos, effectiveGoal) + layerPenalty);
         }
 
         let found: number | undefined;
@@ -589,7 +716,7 @@ export class MapNavGraph {
                 gScore.set(nid, ng);
                 came.set(nid, id);
                 const layerPenalty = next.layer === toLayer ? 0 : (next.kind === "stair" ? 4 : 10);
-                heap.push(nid, ng + v2.distance(next.pos, to) + layerPenalty);
+                heap.push(nid, ng + v2.distance(next.pos, effectiveGoal) + layerPenalty);
             }
         }
 
@@ -616,10 +743,10 @@ export class MapNavGraph {
             out.push(pos);
         }
 
-        // Connect from final node to destination
+        // Connect from final node to effectiveGoal
         const lastPos = out[out.length - 1];
-        if (lastPos && v2.distance(lastPos, to) > 0.8) {
-            out.push(v2.copy(to));
+        if (lastPos && v2.distance(lastPos, effectiveGoal) > 0.6) {
+            out.push(v2.copy(effectiveGoal));
         }
 
         if (!hasPenalties) this.remember(cacheKey, out);
@@ -646,26 +773,28 @@ export class MapNavGraph {
             if (isSeparatedByWall(game, from, n.pos, layer)) continue;
 
             const dist = v2.distance(from, n.pos);
-            if (
-                isCapsuleClear(game, from, n.pos, layer, ZombieNavRadius, true)
-                || isCapsuleClear(game, from, n.pos, layer, 0.75, true)
-                || isCapsuleClear(game, from, n.pos, layer, 0.35, true)
-                || dist < 2.5
-                || (onStair && n.kind === "stair")
-            ) {
+            const clearWide = isCapsuleClear(game, from, n.pos, layer, ZombieNavRadius, true);
+            if (clearWide) {
                 valid.push(n);
             }
         }
 
-        // Fallback: If no candidate had strict capsule clearance, fallback ONLY to candidate not separated by a wall
+        // Fallback: If no candidate had strict capsule clearance, fallback to relaxed clearance or close clear line
         if (!valid.length) {
             for (let i = 0; i < raw.length; i++) {
                 const n = raw[i];
                 if (buildingId === undefined && n.kind === "interior") continue;
                 if (buildingId !== undefined && (n.kind === "open" || n.kind === "hull")) continue;
-                if (!isSeparatedByWall(game, from, n.pos, layer)) {
+                if (isSeparatedByWall(game, from, n.pos, layer)) continue;
+
+                const dist = v2.distance(from, n.pos);
+                if (
+                    isCapsuleClear(game, from, n.pos, layer, 0.75, true)
+                    || isCapsuleClear(game, from, n.pos, layer, 0.35, true)
+                    || (dist < 2.5 && isLineClear(game, from, n.pos, layer, true))
+                    || (onStair && n.kind === "stair")
+                ) {
                     valid.push(n);
-                    break;
                 }
             }
         }
@@ -679,43 +808,107 @@ export class MapNavGraph {
         layer: number,
         radius: number,
         buildingId?: number,
-    ): NavNode[] {
-        const raw = this.nearby(to, layer, radius, false, buildingId);
-        const valid: NavNode[] = [];
+        approachPos?: Vec2 | null,
+    ): { ends: NavNode[]; candidates: CandidateGoalReport[] } {
+        const effectiveGoal = approachPos ?? to;
+        const candidates: CandidateGoalReport[] = [];
+        const seen = new Set<number>();
+        const candidateNodes: NavNode[] = [];
 
-        for (let i = 0; i < raw.length; i++) {
-            const n = raw[i];
-            if (buildingId === undefined && n.kind === "interior") continue;
-            if (buildingId !== undefined && (n.kind === "open" || n.kind === "hull")) continue;
-
-            // Reject any node that is separated from 'to' by a solid wall or locked door
-            if (isSeparatedByWall(game, n.pos, to, layer)) continue;
-
-            const dist = v2.distance(n.pos, to);
-            if (
-                isCapsuleClear(game, n.pos, to, layer, ZombieNavRadius, true)
-                || isCapsuleClear(game, n.pos, to, layer, 0.75, true)
-                || isCapsuleClear(game, n.pos, to, layer, 0.35, true)
-                || dist < 2.5
-            ) {
-                valid.push(n);
+        // 1. Collect candidates around effectiveGoal and to
+        const poolA = this.nearby(effectiveGoal, layer, radius, false, buildingId);
+        for (let i = 0; i < poolA.length; i++) {
+            if (!seen.has(poolA[i].id)) {
+                seen.add(poolA[i].id);
+                candidateNodes.push(poolA[i]);
+            }
+        }
+        if (approachPos && v2.distance(approachPos, to) > 0.5) {
+            const poolB = this.nearby(to, layer, radius, false, buildingId);
+            for (let i = 0; i < poolB.length; i++) {
+                if (!seen.has(poolB[i].id)) {
+                    seen.add(poolB[i].id);
+                    candidateNodes.push(poolB[i]);
+                }
             }
         }
 
-        // Fallback: If no candidate had strict capsule clearance, fallback ONLY to candidate not separated by a wall
+        const valid: NavNode[] = [];
+
+        for (let i = 0; i < candidateNodes.length; i++) {
+            const n = candidateNodes[i];
+            const dist = v2.distance(n.pos, effectiveGoal);
+            let rejectionReason = "";
+
+            // Check 1: Map layer match
+            if (n.layer !== layer) {
+                rejectionReason = "layer_mismatch";
+            }
+            // Check 2: Room / building connectivity
+            else if (buildingId !== undefined) {
+                if (n.kind === "open" || n.kind === "hull") {
+                    rejectionReason = "exterior_node_for_indoor_target";
+                } else if (n.buildingId !== undefined && n.buildingId !== buildingId && n.kind !== "door") {
+                    rejectionReason = "different_building";
+                }
+            } else if (buildingId === undefined && n.kind === "interior") {
+                rejectionReason = "interior_node_for_outdoor_target";
+            }
+
+            // Check 3: Physical collision clearance at the node position
+            if (!rejectionReason) {
+                const ignoreDoors = n.kind === "door";
+                if (!pointClear(game, n.pos, layer, ZombieNavRadius, ignoreDoors)) {
+                    rejectionReason = "node_clearance_blocked";
+                }
+            }
+
+            // Check 4: Wall separation from effectiveGoal (or to)
+            if (!rejectionReason) {
+                if (isSeparatedByWall(game, n.pos, effectiveGoal, layer) || isSeparatedByWall(game, n.pos, to, layer)) {
+                    rejectionReason = "separated_by_wall";
+                }
+            }
+
+            // Check 5: Valid traversable connection to effectiveGoal
+            if (!rejectionReason) {
+                const clearWide = isCapsuleClear(game, n.pos, effectiveGoal, layer, ZombieNavRadius, true);
+                if (clearWide) {
+                    rejectionReason = "accepted";
+                    valid.push(n);
+                } else {
+                    const clearMid = isCapsuleClear(game, n.pos, effectiveGoal, layer, 0.75, true);
+                    const clearNarrow = isCapsuleClear(game, n.pos, effectiveGoal, layer, 0.35, true);
+                    if (clearMid || clearNarrow || dist < 2.5) {
+                        rejectionReason = "accepted_relaxed";
+                    } else {
+                        rejectionReason = "no_clear_path_to_goal";
+                    }
+                }
+            }
+
+            candidates.push({
+                id: n.id,
+                kind: n.kind,
+                pos: v2.copy(n.pos),
+                dist,
+                rejectionReason,
+            });
+        }
+
+        // Fallback: If no candidate passed strict capsule check, accept candidates that are in the same room/environment and not separated by a wall
         if (!valid.length) {
-            for (let i = 0; i < raw.length; i++) {
-                const n = raw[i];
-                if (buildingId === undefined && n.kind === "interior") continue;
-                if (buildingId !== undefined && (n.kind === "open" || n.kind === "hull")) continue;
-                if (!isSeparatedByWall(game, n.pos, to, layer)) {
+            for (let i = 0; i < candidates.length; i++) {
+                const report = candidates[i];
+                if (report.rejectionReason === "accepted_relaxed" || report.rejectionReason === "no_clear_path_to_goal") {
+                    const n = this.nodes[report.id];
                     valid.push(n);
                     break;
                 }
             }
         }
 
-        return valid;
+        return { ends: valid, candidates };
     }
 
     private sample(game: Game): void {
@@ -913,14 +1106,15 @@ export class MapNavGraph {
         building: Building | undefined,
         layer: number,
     ): { outside: number; portal: number; inside: number } {
+        const center = getDoorwayCenter(door);
         const n = doorNormal(door);
-        const distA = this.findClearDoorStance(game, door.pos, n, 2.5, layer);
-        const distB = this.findClearDoorStance(game, door.pos, v2.neg(n), 2.5, layer);
+        const distA = this.findClearDoorStance(game, center, n, 2.5, layer);
+        const distB = this.findClearDoorStance(game, center, v2.neg(n), 2.5, layer);
 
         // Determine which side is inside vs outside relative to building center (if in a building)
         let isAInside = true;
         if (building) {
-            const toBuilding = v2.sub(building.pos, door.pos);
+            const toBuilding = v2.sub(building.pos, center);
             isAInside = v2.dot(n, toBuilding) >= 0;
         }
 
@@ -929,9 +1123,9 @@ export class MapNavGraph {
         const outsideDist = isAInside ? distB : distA;
         const insideDist = isAInside ? distA : distB;
 
-        const outside = v2.add(door.pos, v2.mul(outsideDir, outsideDist));
-        const inside = v2.add(door.pos, v2.mul(insideDir, insideDist));
-        const portal = v2.copy(door.pos);
+        const outside = v2.add(center, v2.mul(outsideDir, outsideDist));
+        const inside = v2.add(center, v2.mul(insideDir, insideDist));
+        const portal = v2.copy(center);
 
         game.map.clampToMapBounds(outside, 4);
         game.map.clampToMapBounds(inside, 4);
@@ -1145,6 +1339,7 @@ export class MapNavGraph {
         maxDist: number,
         includeStairs = false,
         buildingId?: number,
+        maxOut = 20,
     ): NavNode[] {
         const reach = Math.ceil(maxDist / HashCell);
         const cx = Math.floor(pos.x / HashCell);
@@ -1159,9 +1354,13 @@ export class MapNavGraph {
                     const node = this.nodes[ids[i]];
                     if (node.layer !== layer && !(includeStairs && node.kind === "stair")) continue;
                     if (buildingId !== undefined) {
+                        if (node.kind === "hull" || node.kind === "open") continue;
                         if (node.buildingId !== undefined && node.buildingId !== buildingId && node.kind !== "door") {
                             continue;
                         }
+                    } else {
+                        // When outdoors, reject interior nodes
+                        if (node.kind === "interior") continue;
                     }
                     if (v2.distance(pos, node.pos) <= maxDist) out.push(node);
                 }
@@ -1170,7 +1369,7 @@ export class MapNavGraph {
 
         if (out.length) {
             out.sort((a, b) => v2.distance(pos, a.pos) - v2.distance(pos, b.pos));
-            if (out.length > 20) out.length = 20;
+            if (out.length > maxOut) out.length = maxOut;
             return out;
         }
 
@@ -1180,9 +1379,12 @@ export class MapNavGraph {
             const node = this.nodes[i];
             if (node.layer !== layer && !(includeStairs && node.kind === "stair")) continue;
             if (buildingId !== undefined) {
+                if (node.kind === "hull" || node.kind === "open") continue;
                 if (node.buildingId !== undefined && node.buildingId !== buildingId && node.kind !== "door") {
                     continue;
                 }
+            } else {
+                if (node.kind === "interior") continue;
             }
             const d = v2.distance(pos, node.pos);
             if (d < bestDist) {
@@ -1207,7 +1409,8 @@ export class MapNavGraph {
         nodes: Array<{ id: number; pos: Vec2; layer: number; kind: string }>;
         edges: Array<{ fromId: number; toId: number; isDoor: boolean; isTraversable: boolean }>;
     } {
-        const localNodes = this.nearby(center, layer, radius, true);
+        const b = getBuildingAt(game, center);
+        const localNodes = this.nearby(center, layer, radius, true, b?.__id, 100);
         const nodeMap = new Map<number, NavNode>();
         for (let i = 0; i < localNodes.length; i++) {
             nodeMap.set(localNodes[i].id, localNodes[i]);

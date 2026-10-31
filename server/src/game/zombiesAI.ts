@@ -1,8 +1,10 @@
 import type { ZombieDef } from "../../../shared/defs/gameObjects/zombieDefs.ts";
+import { MapObjectDefs } from "../../../shared/defs/register.ts";
 import { GameConfig } from "../../../shared/gameConfig.ts";
 import type { NavDebugZombie } from "../../../shared/net/net.ts";
 import { ObjectType } from "../../../shared/net/objectSerializeFns.ts";
 import { collider } from "../../../shared/utils/collider.ts";
+import { math } from "../../../shared/utils/math.ts";
 import { util } from "../../../shared/utils/util.ts";
 import { v2, type Vec2 } from "../../../shared/utils/v2.ts";
 import type { Game } from "./game.ts";
@@ -10,7 +12,11 @@ import type { Obstacle } from "./objects/obstacle.ts";
 import type { Player } from "./objects/player.ts";
 import { type ZombieNavFailureDiagnostic, ZombiesNavDebugger } from "./zombiesDebug.ts";
 import {
+    type DetailedPathResult,
+    doorNormal,
     getBuildingAt,
+    getDoorwayCenter,
+    getReachableMeleeApproach,
     inferGroundLayer,
     isCapsuleClear,
     MapNavGraph,
@@ -86,14 +92,19 @@ export function isPathPassable(
 }
 
 /**
- * Scans for nearby closed doors along the path toward the goal and triggers their opening mechanism.
- * Locked doors, already open doors, and doors restricted by one-way orientation are strictly ignored.
+ * Scans for nearby doors along the path toward the goal and triggers opening or closing as required.
+ * - Closed doors along the route are opened.
+ * - Open doors whose swung panel obstructs movement are closed when closing creates a valid passage.
+ * - Locked doors and doors restricted by one-way orientation are strictly respected.
  */
-export function tryOpenDoorsAlongRoute(
+export function tryInteractDoorsAlongRoute(
     zombie: Player,
     goal: Vec2,
     doorCooldowns?: Map<number, number>,
     doorFailures?: Map<number, number>,
+    doorToggles?: Map<number, number>,
+    doorLastAction?: Map<number, "open" | "close">,
+    isOpenDoorBlocking?: (door: Obstacle) => boolean,
 ): boolean {
     const scanRadius = zombie.rad + 2.6;
     const objs = zombie.game.grid.intersectCollider(collider.createCircle(zombie.pos, scanRadius));
@@ -102,7 +113,7 @@ export function tryOpenDoorsAlongRoute(
         const obj = objs[i];
         if (obj.__type !== ObjectType.Obstacle) continue;
         const door = obj as Obstacle;
-        if (!door.isDoor || !door.door || door.dead || door.door.open) continue;
+        if (!door.isDoor || !door.door || door.dead) continue;
         if (!util.sameLayer(door.layer, zombie.layer)) continue;
 
         // Check per-door cooldown
@@ -122,44 +133,100 @@ export function tryOpenDoorsAlongRoute(
             || v2.distance(zombie.pos, door.pos) <= reach;
         if (!inReach) continue;
 
-        // Check if door is relevant to active movement route
-        const toGoal = v2.sub(goal, zombie.pos);
-        const toDoor = v2.sub(door.pos, zombie.pos);
-        const goalDist = v2.length(toGoal);
-        const doorDist = v2.length(toDoor);
-
-        let isRelevant = false;
-        if (goalDist < 0.3 || doorDist <= reach * 0.85) {
-            isRelevant = true;
-        } else {
-            const along = v2.dot(toDoor, v2.normalizeSafe(toGoal));
-            if (along > -0.6 && along < goalDist + door.interactionRad + 1.5) {
-                isRelevant = true;
+        // If locked or unusable, count as failed attempt to trigger alternate routing
+        if (door.door.locked || !door.door.canUse) {
+            if (doorFailures) {
+                const fails = (doorFailures.get(door.__id) ?? 0) + 1;
+                doorFailures.set(door.__id, fails);
             }
+            continue;
         }
 
-        if (isRelevant) {
-            // If locked or unusable, count as a failed attempt to trigger alternate routing
-            if (door.door.locked || !door.door.canUse) {
+        // Check toggle limit to prevent endless oscillation (allow up to 6 toggles)
+        if (doorToggles) {
+            const toggles = doorToggles.get(door.__id) ?? 0;
+            if (toggles >= 6) {
                 if (doorFailures) {
-                    const fails = (doorFailures.get(door.__id) ?? 0) + 1;
-                    doorFailures.set(door.__id, fails);
+                    doorFailures.set(door.__id, 3);
                 }
                 continue;
             }
+        }
 
-            door.openDoor(zombie);
-            if (doorCooldowns) {
-                doorCooldowns.set(door.__id, 1.2);
+        if (!door.door.open) {
+            // If the zombie just closed this door, do not reopen it unless the route explicitly crosses the closed doorframe
+            if (doorLastAction && doorLastAction.get(door.__id) === "close") {
+                const crossesFrame = collider.intersectSegment(door.collider, zombie.pos, goal);
+                if (!crossesFrame) continue;
             }
-            if (doorFailures) {
-                doorFailures.delete(door.__id);
+
+            // Closed door: check if door is relevant to active movement route
+            const toGoal = v2.sub(goal, zombie.pos);
+            const toDoor = v2.sub(door.pos, zombie.pos);
+            const goalDist = v2.length(toGoal);
+            const doorDist = v2.length(toDoor);
+
+            let isRelevant = false;
+            const crossesFrame = collider.intersectSegment(door.collider, zombie.pos, goal);
+            const goalNearDoor = collider.intersectCircle(door.collider, goal, zombie.rad + 0.5);
+            if (crossesFrame || goalNearDoor) {
+                isRelevant = true;
+            } else if (doorDist <= reach) {
+                // If moving generally toward the door, or goal is beyond the door
+                const along = v2.dot(toDoor, v2.normalizeSafe(toGoal));
+                if (along > -0.5 || doorDist <= 1.8) {
+                    isRelevant = true;
+                }
             }
-            ZombiesNavDebugger.recordDoor(zombie.__id, door.pos, "interact");
-            return true;
+
+            if (isRelevant) {
+                door.openDoor(zombie);
+                if (doorCooldowns) {
+                    doorCooldowns.set(door.__id, 1.2);
+                }
+                if (doorToggles) {
+                    doorToggles.set(door.__id, (doorToggles.get(door.__id) ?? 0) + 1);
+                }
+                if (doorLastAction) {
+                    doorLastAction.set(door.__id, "open");
+                }
+                if (doorFailures) {
+                    doorFailures.delete(door.__id);
+                }
+                ZombiesNavDebugger.recordDoor(zombie.__id, door.pos, "open");
+                return true;
+            }
+        } else {
+            // Open door: check if swung door panel obstructs the route
+            if (isOpenDoorBlocking && isOpenDoorBlocking(door)) {
+                door.closeDoor(zombie);
+                if (doorCooldowns) {
+                    doorCooldowns.set(door.__id, 1.2);
+                }
+                if (doorToggles) {
+                    doorToggles.set(door.__id, (doorToggles.get(door.__id) ?? 0) + 1);
+                }
+                if (doorLastAction) {
+                    doorLastAction.set(door.__id, "close");
+                }
+                if (doorFailures) {
+                    doorFailures.delete(door.__id);
+                }
+                ZombiesNavDebugger.recordDoor(zombie.__id, door.pos, "close");
+                return true;
+            }
         }
     }
     return false;
+}
+
+export function tryOpenDoorsAlongRoute(
+    zombie: Player,
+    goal: Vec2,
+    doorCooldowns?: Map<number, number>,
+    doorFailures?: Map<number, number>,
+): boolean {
+    return tryInteractDoorsAlongRoute(zombie, goal, doorCooldowns, doorFailures);
 }
 
 export type ZombieState = "idle" | "chase" | "attack";
@@ -195,6 +262,8 @@ export class ZombieAI {
     doorCooldownTimer = 0;
     doorCooldowns = new Map<number, number>();
     doorFailures = new Map<number, number>();
+    doorToggles = new Map<number, number>();
+    doorLastAction = new Map<number, "open" | "close">();
     edgePenalties = new Map<string, number>();
 
     // Diagnostics and metrics tracking
@@ -214,6 +283,10 @@ export class ZombieAI {
     // Entity separation jitter (adapted from Fireteam CQC)
     strafeSign = Math.random() < 0.5 ? 1 : -1;
     strafeFlipTimer = 0.8;
+
+    // Diagnostic logging rate limiting
+    private lastLoggedFailureTime = 0;
+    private lastLoggedFailureReason = "";
 
     isDead = false;
 
@@ -270,7 +343,88 @@ export class ZombieAI {
     }
 
     /**
-     * Scans for an obstacle (closed door or breakable barricade) within interaction range.
+     * Evaluates whether an open door's physical swung panel is obstructing the zombie's route,
+     * and whether closing the door would create a valid passage.
+     */
+    isOpenDoorBlockingRoute(door: Obstacle): boolean {
+        if (!door.isDoor || !door.door || !door.door.open || door.dead || door.door.locked || !door.door.canUse) {
+            return false;
+        }
+
+        const cd = this.doorCooldowns.get(door.__id) ?? 0;
+        if (cd > 0) return false;
+
+        const toggles = this.doorToggles.get(door.__id) ?? 0;
+        if (toggles >= 3) return false;
+
+        // If the zombie's current route is actively planning to traverse through this door's frame,
+        // closing the door would block the passage. An open door must remain open for doorway traversal.
+        for (let i = this.currentWaypointIndex; i < this.currentPath.length; i++) {
+            const wp = this.currentPath[i];
+            const node = this.navGraph.findNearestNavNode(wp, this.zombie.layer, 2.5);
+            if (node && node.kind === "door" && node.obstacleId === door.__id) {
+                return false;
+            }
+        }
+
+        // Compute closed collider geometry
+        const def = MapObjectDefs.typeToDef(door.type, "obstacle");
+        if (!def?.collision) return false;
+        const closedRot = math.oriToRad(door.door.closedOri);
+        const closedColl = collider.transform(def.collision, door.pos, closedRot, door.scale);
+
+        // An open door panel only swings into corridors/rooms if it is actually rotated open
+        if (Math.abs(door.rot - closedRot) < 1e-4) {
+            return false;
+        }
+
+        // Check if the current goal or next waypoint passes through the doorway frame
+        const nextWaypoint = this.currentPath[this.currentWaypointIndex] ?? this.target?.pos;
+        if (nextWaypoint) {
+            // If zombie and waypoint/target are on opposite sides of the doorframe and near the doorway,
+            // the zombie is actively traversing through this entrance: DO NOT CLOSE IT
+            const center = getDoorwayCenter(door);
+            const n = doorNormal(door);
+            const dotZombie = v2.dot(n, v2.sub(this.zombie.pos, center));
+            const dotGoal = v2.dot(n, v2.sub(nextWaypoint, center));
+            if (dotZombie * dotGoal < 0 && Math.abs(dotZombie) < 4.5 && Math.abs(dotGoal) < 6.0) {
+                return false;
+            }
+
+            // If heading through the doorway frame, do NOT close it
+            if (collider.intersectSegment(closedColl, this.zombie.pos, nextWaypoint)) {
+                return false;
+            }
+            if (collider.intersectCircle(closedColl, nextWaypoint, this.zombie.rad)) {
+                return false;
+            }
+        }
+
+        // 1. Check if the zombie is currently in physical contact with or stuck against this open door panel
+        const zombieTouchesOpenDoor = collider.intersectCircle(door.collider, this.zombie.pos, this.zombie.rad + 0.15);
+        if (zombieTouchesOpenDoor) {
+            // Closing frees the zombie if the closed collider does not intersect the zombie (i.e. zombie not in doorframe)
+            if (!collider.intersectCircle(closedColl, this.zombie.pos, this.zombie.rad)) {
+                return true;
+            }
+        }
+
+        // 2. Check if the zombie's active path or immediate movement segment intersects the open door panel
+        if (nextWaypoint) {
+            const pathBlockedByOpenDoor = collider.intersectSegment(door.collider, this.zombie.pos, nextWaypoint);
+            if (pathBlockedByOpenDoor) {
+                // If closing does not block the waypoint and does not hit the zombie, closing creates a valid passage
+                if (!collider.intersectCircle(closedColl, this.zombie.pos, this.zombie.rad)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Scans for an obstacle (closed door, route-blocking open door, or breakable barricade) within interaction range.
      */
     findNearbyObstacleToBreach(maxDist = 2.8): Obstacle | null {
         const scanBounds = collider.createAabb(
@@ -289,13 +443,27 @@ export class ZombieAI {
 
             const isBarricade = !!o.isBarricade;
             const isClosedDoor = o.isDoor && o.door && !o.door.open;
+            const isOpenDoorBlocking = o.isDoor && o.door && o.door.open && !o.door.locked && o.door.canUse && this.isOpenDoorBlockingRoute(o);
 
-            if (!isBarricade && !isClosedDoor) continue;
-            // Locked doors that are not breakable barricades cannot be breached
-            if (isClosedDoor && o.door!.locked && !isBarricade) continue;
+            if (!isBarricade && !isClosedDoor && !isOpenDoorBlocking) continue;
+
+            // Check door cooldown and toggle limits
+            if (o.isDoor) {
+                const cd = this.doorCooldowns.get(o.__id) ?? 0;
+                if (cd > 0) continue;
+                const toggles = this.doorToggles.get(o.__id) ?? 0;
+                if (toggles >= 3) continue;
+            }
+
+            // For closed doors: only breach if the zombie did NOT just close it
+            if (isClosedDoor) {
+                if (o.door!.locked && !isBarricade) continue;
+                if (this.doorLastAction.get(o.__id) === "close") continue;
+            }
 
             const dist = v2.distance(this.zombie.pos, o.pos);
-            if (dist < bestDist && dist <= maxDist) {
+            const inReach = dist <= maxDist || (o.isDoor && !!collider.intersectCircle(o.collider, this.zombie.pos, maxDist));
+            if (inReach && dist < bestDist) {
                 bestDist = dist;
                 bestObstacle = o;
             }
@@ -422,7 +590,10 @@ export class ZombieAI {
 
         // --- Periodic & Event-Driven Six-Need Utility AI Evaluation ---
         const inAttackReach = !!(this.target && distToTarget <= this.def.attackRange && hasLoS);
-        const reachedBreach = !!(breachObstacle && v2.distance(this.zombie.pos, breachObstacle.pos) <= 2.2);
+        const reachedBreach = !!(breachObstacle && (
+            v2.distance(this.zombie.pos, breachObstacle.pos) <= 2.8
+            || (breachObstacle.isDoor && !!collider.intersectCircle(breachObstacle.collider, this.zombie.pos, 2.5))
+        ));
         const isEventTriggered = inAttackReach || reachedBreach || this.staggerDuration > 0;
 
         if (this.utilityEvalTimer <= 0 || isEventTriggered) {
@@ -508,15 +679,34 @@ export class ZombieAI {
         if (this.activeAction === "breach" && breachObstacle) {
             const isBarricade = !!breachObstacle.isBarricade;
             const isClosedDoor = breachObstacle.isDoor && breachObstacle.door && !breachObstacle.door.open;
+            const isOpenDoor = breachObstacle.isDoor && breachObstacle.door && breachObstacle.door.open;
 
-            if (isClosedDoor && !breachObstacle.door!.locked) {
+            if (isClosedDoor && !breachObstacle.door!.locked && breachObstacle.door!.canUse) {
                 // Open unlocked door
                 breachObstacle.openDoor(this.zombie);
                 this.doorInteractionAttempts++;
+                this.doorCooldownTimer = 1.2;
+                this.doorCooldowns.set(breachObstacle.__id, 1.2);
+                this.doorLastAction.set(breachObstacle.__id, "open");
+                const toggles = (this.doorToggles.get(breachObstacle.__id) ?? 0) + 1;
+                this.doorToggles.set(breachObstacle.__id, toggles);
                 this.navGraph.invalidateCache();
                 this.pathRecalcTimer = 0;
                 this.utilityEvalTimer = 0;
-                ZombiesNavDebugger.recordDoor(this.zombie.__id, breachObstacle.pos, "interact");
+                ZombiesNavDebugger.recordDoor(this.zombie.__id, breachObstacle.pos, "open");
+            } else if (isOpenDoor && !breachObstacle.door!.locked && breachObstacle.door!.canUse && this.isOpenDoorBlockingRoute(breachObstacle)) {
+                // Close open door that is blocking route
+                breachObstacle.closeDoor(this.zombie);
+                this.doorInteractionAttempts++;
+                this.doorCooldownTimer = 1.2;
+                this.doorCooldowns.set(breachObstacle.__id, 1.2);
+                this.doorLastAction.set(breachObstacle.__id, "close");
+                const toggles = (this.doorToggles.get(breachObstacle.__id) ?? 0) + 1;
+                this.doorToggles.set(breachObstacle.__id, toggles);
+                this.navGraph.invalidateCache();
+                this.pathRecalcTimer = 0;
+                this.utilityEvalTimer = 0;
+                ZombiesNavDebugger.recordDoor(this.zombie.__id, breachObstacle.pos, "close");
             } else if (isBarricade) {
                 // Melee attack breakable barricade
                 this.stop();
@@ -556,22 +746,29 @@ export class ZombieAI {
             return;
         }
 
-        // Direct pursuit check: same ground layer, within 12u, same building context, full capsule clear
+        // Compute reachable melee approach position if pursuing a target player
+        const targetBuilding = getBuildingAt(this.game, destination);
+        const approachPos = this.target && this.activeAction !== "investigate"
+            ? getReachableMeleeApproach(this.game, this.target.pos, this.zombie.pos, this.zombie.layer, targetBuilding, ZombieNavRadius)
+            : null;
+        const effectiveGoal = approachPos ?? destination;
+
+        // Direct pursuit check: same ground layer, within 12u, same building context, full capsule clear to effectiveGoal
         const sameGround = this.target ? util.toGroundLayer(this.zombie.layer) === util.toGroundLayer(this.target.layer) : true;
-        const sameBuilding = getBuildingAt(this.game, this.zombie.pos) === getBuildingAt(this.game, destination);
+        const sameBuilding = getBuildingAt(this.game, this.zombie.pos) === targetBuilding;
         const canDirectPursue = !!(
             this.target
             && this.activeAction !== "investigate"
             && sameGround
             && sameBuilding
             && distToTarget < 12.0
-            && isCapsuleClear(this.game, this.zombie.pos, destination, this.zombie.layer, ZombieNavRadius, false)
+            && isCapsuleClear(this.game, this.zombie.pos, effectiveGoal, this.zombie.layer, ZombieNavRadius, false)
         );
 
         let goal: Vec2;
 
         if (canDirectPursue) {
-            goal = destination;
+            goal = effectiveGoal;
             this.currentPath.length = 0;
             this.currentWaypointIndex = 0;
             this.isTargetReachable = true;
@@ -611,6 +808,7 @@ export class ZombieAI {
                     toLayer,
                     this.zombie.layer,
                     this.edgePenalties,
+                    approachPos,
                 );
 
                 this.navigationResult = detailed.result;
@@ -623,14 +821,15 @@ export class ZombieAI {
                     this.noRoute = true;
                     this.state = "idle";
                     this.stop();
+                    // Controlled backoff for stationary targets to avoid excessive recalculations
                     this.pathRecalcTimer = 1.0 + Math.random() * 0.4;
-                    this.recordFailureDiagnostic("no_route", detailed.failureReason);
+                    this.recordFailureDiagnostic("no_route", detailed.failureReason, detailed);
                     return;
                 }
 
                 this.isTargetReachable = true;
                 this.noRoute = false;
-                this.pathRecalcTimer = 0.4 + Math.random() * 0.1;
+                this.pathRecalcTimer = 0.5 + Math.random() * 0.1;
 
                 ZombiesNavDebugger.recordPath(
                     this.zombie.__id,
@@ -655,9 +854,22 @@ export class ZombieAI {
                             ZombieNavRadius,
                             false,
                         )
+                        || isCapsuleClear(
+                            this.game,
+                            this.zombie.pos,
+                            this.currentPath[i],
+                            this.zombie.layer,
+                            this.zombie.rad,
+                            false,
+                        )
                     ) {
                         bestIdx = i;
                         break;
+                    }
+                }
+                if (bestIdx === 0 && this.currentPath.length > 1) {
+                    if (v2.distance(this.zombie.pos, this.currentPath[0]) <= 1.2) {
+                        bestIdx = 1;
                     }
                 }
                 this.currentWaypointIndex = bestIdx;
@@ -678,7 +890,10 @@ export class ZombieAI {
                 // Safe corner shortcutting: advance ONLY if full physical capsule is completely clear
                 if (this.currentWaypointIndex + 1 < this.currentPath.length) {
                     const nextWp = this.currentPath[this.currentWaypointIndex + 1];
-                    if (isCapsuleClear(this.game, this.zombie.pos, nextWp, this.zombie.layer, ZombieNavRadius, false)) {
+                    if (
+                        isCapsuleClear(this.game, this.zombie.pos, nextWp, this.zombie.layer, ZombieNavRadius, false)
+                        || isCapsuleClear(this.game, this.zombie.pos, nextWp, this.zombie.layer, this.zombie.rad, false)
+                    ) {
                         this.currentWaypointIndex++;
                         wp = nextWp;
                     }
@@ -686,9 +901,9 @@ export class ZombieAI {
 
                 goal = (this.currentWaypointIndex < this.currentPath.length)
                     ? this.currentPath[this.currentWaypointIndex]
-                    : destination;
+                    : effectiveGoal;
             } else {
-                goal = destination;
+                goal = effectiveGoal;
             }
 
             ZombiesNavDebugger.recordWaypoint(this.zombie.__id, this.currentWaypointIndex, goal);
@@ -700,12 +915,20 @@ export class ZombieAI {
             return;
         }
 
-        // Door interaction: open closed unlocked doors along route
+        // Door interaction: open closed unlocked doors or close route-blocking open doors along route
         if (this.doorCooldownTimer > 0) {
             this.doorCooldownTimer -= dt;
         } else {
             this.doorCooldownTimer = 0.25;
-            if (tryOpenDoorsAlongRoute(this.zombie, goal, this.doorCooldowns, this.doorFailures)) {
+            if (tryInteractDoorsAlongRoute(
+                this.zombie,
+                goal,
+                this.doorCooldowns,
+                this.doorFailures,
+                this.doorToggles,
+                this.doorLastAction,
+                (d) => this.isOpenDoorBlockingRoute(d),
+            )) {
                 this.doorInteractionAttempts++;
                 this.doorCooldownTimer = 0.4;
                 this.navGraph.invalidateCache();
@@ -766,8 +989,22 @@ export class ZombieAI {
                 this.stuckStrikes++;
                 this.timeSpentStuck += 0.4;
 
-                // Check for closed doors without inflating interaction counter on open doors
-                if (tryOpenDoorsAlongRoute(this.zombie, goal, this.doorCooldowns)) {
+                // When stuck, clear door cooldowns to immediately allow clearing any door obstacle
+                for (const [doorId] of this.doorCooldowns) {
+                    this.doorCooldowns.set(doorId, 0);
+                }
+                this.doorCooldownTimer = 0;
+
+                // Check for closed or route-blocking open doors without inflating interaction counter on clear doors
+                if (tryInteractDoorsAlongRoute(
+                    this.zombie,
+                    goal,
+                    this.doorCooldowns,
+                    this.doorFailures,
+                    this.doorToggles,
+                    this.doorLastAction,
+                    (d) => this.isOpenDoorBlockingRoute(d),
+                )) {
                     this.doorInteractionAttempts++;
                 }
 
@@ -802,10 +1039,20 @@ export class ZombieAI {
     private recordFailureDiagnostic(
         failureType: "no_route" | "stuck" | "door_failure" | "collision_obstruction",
         specificReason?: string,
+        detailed?: DetailedPathResult,
     ): void {
+        const now = Date.now();
+        const reason = specificReason ?? this.navGraph.lastFailureReason;
+        if (reason === this.lastLoggedFailureReason && now - this.lastLoggedFailureTime < 3000) {
+            return;
+        }
+        this.lastLoggedFailureTime = now;
+        this.lastLoggedFailureReason = reason;
+
         const fromLayer = navGroundLayer(this.zombie.layer);
         const toLayer = this.target ? inferGroundLayer(this.game, this.target.pos, this.target.layer) : fromLayer;
         const targetPos = this.target ? v2.copy(this.target.pos) : v2.copy(this.zombie.pos);
+        const targetBuilding = getBuildingAt(this.game, targetPos);
 
         const currentNavNode = this.navGraph.findNearestNavNode(this.zombie.pos, fromLayer);
         const targetNavNode = this.navGraph.findNearestNavNode(targetPos, toLayer);
@@ -844,10 +1091,10 @@ export class ZombieAI {
         }
 
         const diagnostic: ZombieNavFailureDiagnostic = {
-            timestamp: Date.now(),
+            timestamp: now,
             zombieId: this.zombie.__id,
             failureType,
-            failureReason: specificReason ?? this.navGraph.lastFailureReason,
+            failureReason: reason,
             zombiePos: v2.copy(this.zombie.pos),
             zombieLayer: this.zombie.layer,
             targetPos,
@@ -867,6 +1114,14 @@ export class ZombieAI {
             timeSpentStuck: this.timeSpentStuck,
             recalculationCount: this.recalcCount,
             lastRecalcReason: this.lastRecalcReason,
+            // Task 004.11 Goal selection diagnostics
+            targetRadius: this.target ? this.target.rad : 1.0,
+            zombieRadius: ZombieNavRadius,
+            candidateGoalNodes: detailed?.candidatesConsidered,
+            approachPos: detailed?.approachPos ?? null,
+            hasReachableAttackPosition: detailed?.approachPos !== null && detailed?.approachPos !== undefined,
+            targetBuildingId: targetBuilding?.__id,
+            targetBuildingType: targetBuilding?.type,
         };
 
         ZombiesNavDebugger.recordFailure(diagnostic);

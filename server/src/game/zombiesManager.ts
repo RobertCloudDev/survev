@@ -118,7 +118,7 @@ export class ZombiesManager {
             if (livingHuman) {
                 const spawnPos = this.findZombieSpawnPos(livingHuman.pos);
                 if (spawnPos) {
-                    this.spawnZombie("walker", spawnPos);
+                    this.spawnZombie("runner", spawnPos);
                     this.hasSpawnedTestZombie = true;
                 }
             }

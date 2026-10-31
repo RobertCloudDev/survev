@@ -71,6 +71,20 @@ export interface ZombieNavFailureDiagnostic {
     // Number of path recalculations
     recalculationCount: number;
     lastRecalcReason: string;
+    // Task 004.11 Goal selection diagnostics
+    targetRadius?: number;
+    zombieRadius?: number;
+    candidateGoalNodes?: Array<{
+        id: number;
+        kind: string;
+        pos: Vec2;
+        dist: number;
+        rejectionReason: string;
+    }>;
+    approachPos?: Vec2 | null;
+    hasReachableAttackPosition?: boolean;
+    targetBuildingId?: number;
+    targetBuildingType?: string;
 }
 
 /**
